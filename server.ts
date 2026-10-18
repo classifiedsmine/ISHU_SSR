@@ -285,7 +285,7 @@ app.post('/api/auth/signup', async (req, res) => {
       role: isFirstUser ? 'super_admin' : 'user',
       avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400&h=400&fit=crop',
       title: isFirstUser ? 'Super Administrator' : 'Freelancer / Member',
-      rating: 5.0,
+      rating: 0,
       reviewsCount: 0,
       hourlyRate: 50,
       earned: 0,
@@ -1596,6 +1596,8 @@ const DATA_DIR = path.join(__dirname, 'data');
 const MESSAGES_FILE = path.join(DATA_DIR, 'workstream_messages.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'workstream_orders.json');
 const REVIEWS_FILE = path.join(DATA_DIR, 'workstream_reviews.json');
+const REFUNDS_FILE = path.join(DATA_DIR, 'workstream_refunds.json');
+const DISPUTES_FILE = path.join(DATA_DIR, 'workstream_disputes.json');
 const UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_uploads.json'); // Added for completeness
 
 function ensureDataDirectory() {
@@ -1629,6 +1631,8 @@ async function writeJsonAtomic(filePath: string, data: any) {
 export function saveMessagesToDisk() { writeJsonAtomic(MESSAGES_FILE, messages); }
 export function saveOrdersToDisk() { writeJsonAtomic(ORDERS_FILE, orders); }
 export function saveReviewsToDisk() { writeJsonAtomic(REVIEWS_FILE, reviews); }
+export function saveRefundsToDisk() { writeJsonAtomic(REFUNDS_FILE, refunds); }
+export function saveDisputesToDisk() { writeJsonAtomic(DISPUTES_FILE, disputes); }
 export function saveWorkstreamUploadIndex() { writeJsonAtomic(WORKSTREAM_UPLOAD_INDEX_FILE, workstreamUploadIndex); }
 
 function handleCorruption(filePath: string, error: any) {
@@ -1744,6 +1748,32 @@ function loadInitialOrdersAndMessages() {
       }
     } catch (e) {
       handleCorruption(REVIEWS_FILE, e);
+    }
+  }
+
+  // 4. Load Refunds
+  if (fs.existsSync(REFUNDS_FILE)) {
+    try {
+      const data = fs.readFileSync(REFUNDS_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) {
+        refunds = parsed;
+      }
+    } catch (e) {
+      handleCorruption(REFUNDS_FILE, e);
+    }
+  }
+
+  // 5. Load Disputes
+  if (fs.existsSync(DISPUTES_FILE)) {
+    try {
+      const data = fs.readFileSync(DISPUTES_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      if (Array.isArray(parsed)) {
+        disputes = parsed;
+      }
+    } catch (e) {
+      handleCorruption(DISPUTES_FILE, e);
     }
   }
 
@@ -2048,6 +2078,14 @@ app.get('/api/user/quota-status', requireAuth, (req, res) => {
     const buyerPlanId = (user as any).buyerMembershipTier || 'buyer_free';
     const buyerPlan = activeSettings.memberships.buyerPlans.find(p => p.id === buyerPlanId) || activeSettings.memberships.buyerPlans[0];
 
+    const rawBidsLimit = freelancerPlan?.bidsPerMonth ?? 0;
+    const bidsLimit = rawBidsLimit > 0 ? rawBidsLimit : null;
+    const bidsRemaining = bidsLimit !== null ? Math.max(0, bidsLimit - bidsUsed) : null;
+
+    const rawJobPostsLimit = buyerPlan?.jobPostsPerMonth ?? 0;
+    const jobPostsLimit = rawJobPostsLimit > 0 ? rawJobPostsLimit : null;
+    const jobPostsRemaining = jobPostsLimit !== null ? Math.max(0, jobPostsLimit - jobPostsUsed) : null;
+
     res.json({
       success: true,
       membershipsEnabled: activeSettings.memberships.membershipsEnabled,
@@ -2055,15 +2093,17 @@ app.get('/api/user/quota-status', requireAuth, (req, res) => {
         planId: freelancerPlanId,
         planName: freelancerPlan?.name || 'Standard Freelancer',
         bidsUsed,
-        bidsLimit: freelancerPlan?.bidsPerMonth ?? 15,
-        bidsRemaining: Math.max(0, (freelancerPlan?.bidsPerMonth ?? 15) - bidsUsed)
+        bidsLimit,
+        bidsRemaining,
+        unlimited: bidsLimit === null
       },
       buyer: {
         planId: buyerPlanId,
         planName: buyerPlan?.name || 'Standard Client',
         jobPostsUsed,
-        jobPostsLimit: buyerPlan?.jobPostsPerMonth ?? 10,
-        jobPostsRemaining: Math.max(0, (buyerPlan?.jobPostsPerMonth ?? 10) - jobPostsUsed)
+        jobPostsLimit,
+        jobPostsRemaining,
+        unlimited: jobPostsLimit === null
       }
     });
   } catch (err: any) {
@@ -2149,19 +2189,24 @@ syncUserBalances();
 function ensureWallet(userId: string) {
   const u = users.find(x => x.id === userId);
   if (!u || u.role === 'admin' || u.role === 'super_admin') return;
-  const isFreelancer = gigs.some(g => g.freelancerId === u.id) || orders.some(o => o.sellerId === u.id) || u.role === 'freelancer';
+  const isFreelancer = gigs.some(g => g.freelancerId === u.id) || orders.some(o => o.sellerId === u.id) || u.role === 'freelancer' || u.role === 'seller';
   financeLedger.ensureWallet({ userId: u.id, name: u.name, email: u.email, role: isFreelancer ? 'freelancer' : 'buyer' });
 }
 
-function pushSystemMessage(orderId: string, text: string) {
-  recordMessage({
+function pushSystemMessage(orderId: string, text: string, action = 'system_notice') {
+  const msg: Message = {
     id: 'msg_' + randomUUID().slice(0, 12),
     orderId,
     senderId: 'system',
     senderName: 'WorkSphere Escrow Vault',
     text,
-    timestamp: new Date().toISOString()
-  } as Message);
+    timestamp: new Date().toISOString(),
+    type: 'system',
+    metadata: { action }
+  };
+  recordMessage(msg);
+  saveMessagesToDisk();
+  broadcastMessage(msg, orderId);
 }
 
 function closeActiveDispute(orderId: string, status: Dispute['status'], notes: string) {
@@ -2255,6 +2300,8 @@ function refundOrderFunds(order: Order, amount: number | undefined, actor: strin
     });
   }
   syncUserBalances();
+  saveOrdersToDisk();
+  saveRefundsToDisk();
   if (requestKey) requestKeyCache.set(requestKey, result);
   return result;
 }
@@ -2288,6 +2335,8 @@ function splitOrderFunds(order: Order, refundAmount: number, actor: string, reas
     });
   }
   syncUserBalances();
+  saveOrdersToDisk();
+  saveRefundsToDisk();
   if (requestKey) requestKeyCache.set(requestKey, result);
   return result;
 }
@@ -2712,6 +2761,7 @@ app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
     recordMessage(sysMsg);
     saveMessagesToDisk();
     saveOrdersToDisk();
+    saveDisputesToDisk();
     broadcastMessage(sysMsg, order.id);
 
     res.json({ success: true, dispute: newDispute, order: enrichOrderWithServiceInfo(order) });
@@ -4457,7 +4507,7 @@ app.post('/api/reviews', requireAuth, (req, res) => {
   const caller = users.find(u => u.id === authUserId);
   if (!caller) return res.status(401).json({ error: 'Authentication required to submit a review' });
 
-  const { orderId, targetUserId, rating, comment, orderTitle } = req.body;
+  const { orderId, targetUserId, rating, comment } = req.body;
   if (!orderId) {
     return res.status(400).json({ error: 'Order ID is required' });
   }
@@ -5228,8 +5278,8 @@ app.post('/api/gigs', requireAuth, (req, res) => {
     description: escapeHtml(req.body.description || ''),
     price: gigPrice,
     deliveryDays: Number(req.body.deliveryDays),
-    rating: 5.0,
-    reviewsCount: 1,
+    rating: 0,
+    reviewsCount: 0,
     image: req.body.image || 'https://images.unsplash.com/photo-1498050108023-c5249f4df085?w=800&h=500&fit=crop',
     status: initialStatus,
     featured: false,
@@ -5244,25 +5294,8 @@ app.post('/api/projects', requireAuth, (req, res) => {
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
 
-  // Enforce Client Job Post Quota
-  const activeSettings = siteSettings.getSettings();
-  if (activeSettings.memberships.membershipsEnabled) {
-    const planId = (caller as any).buyerMembershipTier || 'buyer_free';
-    const plan = activeSettings.memberships.buyerPlans.find(p => p.id === planId) || activeSettings.memberships.buyerPlans[0];
-    const quotaLimit = plan?.jobPostsPerMonth ?? 10;
-
-    // Count projects posted by caller in current 30-day window
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const recentProjects = projects.filter(p => p.buyerId === caller.id && p.createdAt && p.createdAt.substring(0, 10) >= thirtyDaysAgo);
-
-    if (recentProjects.length >= quotaLimit) {
-      return res.status(403).json({
-        error: `Monthly job post quota reached (${recentProjects.length}/${quotaLimit} posts used). Upgrade your plan to Enterprise Client to post more jobs.`
-      });
-    }
-  }
-
   // Enforce Minimum Project Budget
+  const activeSettings = siteSettings.getSettings();
   const minBudget = activeSettings.marketplace.minimumProjectBudget ?? 20;
   const budgetMin = Number(req.body.budgetMin);
   if (minBudget > 0 && budgetMin < minBudget) {
@@ -5483,6 +5516,10 @@ app.delete('/api/gigs/:id', requireAuth, (req, res) => {
   if (index === -1) return res.status(404).json({ error: 'Gig/Service not found' });
 
   const deleted = gigs[index];
+  if (deleted.freelancerId !== caller.id) {
+    return res.status(403).json({ error: 'Forbidden: You can only delete your own gigs.' });
+  }
+
   gigs.splice(index, 1);
 
   registerAuditLog({
@@ -5502,8 +5539,9 @@ app.patch('/api/gigs/:id', requireAuth, (req, res) => {
   const caller = (req as any).authenticatedUser;
   const g = gigs.find(gig => gig.id === req.params.id);
   if (!g) return res.status(404).json({ error: 'Gig/Service not found' });
-  const isAdmin = caller.role === 'admin' || caller.role === 'super_admin';
-  if (!isAdmin && g.freelancerId !== caller.id) return res.status(403).json({ error: 'Forbidden' });
+  if (g.freelancerId !== caller.id) {
+    return res.status(403).json({ error: 'Forbidden: You can only edit your own gigs.' });
+  }
 
   if (req.body.title !== undefined) g.title = req.body.title;
   if (req.body.category !== undefined) g.category = req.body.category;
@@ -5512,6 +5550,15 @@ app.patch('/api/gigs/:id', requireAuth, (req, res) => {
   if (req.body.price !== undefined) {
     const newPrice = Number(req.body.price);
     if (!Number.isFinite(newPrice)) return res.status(400).json({ error: 'Gig price must be a valid number.' });
+    const activeSettings = siteSettings.getSettings();
+    const minGigPrice = activeSettings.marketplace.minimumGigPrice ?? 10;
+    const maxGigPrice = activeSettings.marketplace.maximumGigPrice ?? 10000;
+    if (newPrice < minGigPrice) {
+      return res.status(400).json({ error: `Gig price ($${newPrice}) cannot be lower than the platform minimum of $${minGigPrice}.` });
+    }
+    if (newPrice > maxGigPrice) {
+      return res.status(400).json({ error: `Gig price ($${newPrice}) cannot exceed the platform maximum of $${maxGigPrice}.` });
+    }
     g.price = newPrice;
   }
   if (req.body.deliveryDays !== undefined) g.deliveryDays = Number(req.body.deliveryDays);
@@ -5537,8 +5584,9 @@ app.patch('/api/gigs/:id/feature', requireAuth, (req, res) => {
   const caller = (req as any).authenticatedUser;
   const g = gigs.find(gig => gig.id === req.params.id);
   if (!g) return res.status(404).json({ error: 'Gig/Service not found' });
-  const isAdmin = caller.role === 'admin' || caller.role === 'super_admin';
-  if (!isAdmin && g.freelancerId !== caller.id) return res.status(403).json({ error: 'Forbidden' });
+  if (g.freelancerId !== caller.id) {
+    return res.status(403).json({ error: 'Forbidden: You can only feature your own gigs.' });
+  }
 
   g.featured = !g.featured;
 
@@ -5623,24 +5671,6 @@ app.post('/api/proposals', requireAuth, (req, res) => {
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
 
-  // Enforce Freelancer Proposal Quota
-  const activeSettings = siteSettings.getSettings();
-  if (activeSettings.memberships.membershipsEnabled) {
-    const planId = (caller as any).membershipTier || 'plan_free';
-    const plan = activeSettings.memberships.freelancerPlans.find(p => p.id === planId) || activeSettings.memberships.freelancerPlans[0];
-    const quotaLimit = plan?.bidsPerMonth ?? 15;
-
-    // Count proposals submitted by caller in current 30-day window
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-    const recentBids = proposals.filter(p => p.freelancerId === caller.id && p.createdAt && p.createdAt.substring(0, 10) >= thirtyDaysAgo);
-
-    if (recentBids.length >= quotaLimit) {
-      return res.status(403).json({
-        error: `Monthly proposal quota reached (${recentBids.length}/${quotaLimit} bids used). Upgrade your membership to WorkPerHour Pro Talent to send more bids.`
-      });
-    }
-  }
-
   const newProp: Proposal = {
     id: 'prop_' + Date.now(),
     projectId: req.body.projectId,
@@ -5677,20 +5707,6 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), (req, res) => {
     if (buyerId === sellerId) return res.status(400).json({ error: 'You cannot order from yourself.' });
     ensureWallet(buyerId); ensureWallet(sellerId);
     if (buyer.status !== 'active' || seller.status !== 'active') return res.status(403).json({ error: 'Both accounts must be active to place an order.' });
-
-    // Enforce Max Active Orders per Freelancer limit
-    const activeSettings = siteSettings.getSettings();
-    const maxActiveOrders = activeSettings.marketplace.maxActiveOrdersPerFreelancer;
-    if (maxActiveOrders > 0) {
-      // Inquiry chats (amount 0, no escrow) are conversations, not work, so they don't count toward the limit.
-      const activeSellerOrders = orders.filter(o => o.sellerId === sellerId && Number(o.amount) > 0 && ['funded_in_escrow', 'in_progress', 'delivered', 'revision'].includes(o.status));
-      if (activeSellerOrders.length >= maxActiveOrders) {
-        return res.status(400).json({
-          error: `This seller has reached the maximum allowed active orders (${activeSellerOrders.length}/${maxActiveOrders}). Please try again later.`
-        });
-      }
-    }
-
     const id = 'ord_' + randomUUID().slice(0, 12);
     const today = new Date().toISOString().split('T')[0];
     let rawAmount = Number(req.body?.amount);
@@ -5705,16 +5721,30 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), (req, res) => {
 
     const requirements = typeof req.body?.requirements === 'string' ? escapeHtml(req.body.requirements.trim()).slice(0, 2000) : '';
 
+    let deliveryDays = 10;
+    if (req.body?.gigId) {
+      const gig = gigs.find(g => g.id === req.body.gigId);
+      if (gig && Number(gig.deliveryDays) > 0) {
+        deliveryDays = Math.max(1, Math.min(365, Number(gig.deliveryDays)));
+      }
+    } else if (req.body?.projectId) {
+      const proj = projects.find(p => p.id === req.body.projectId);
+      if (proj && Number(proj.deadlineDays) > 0) {
+        deliveryDays = Math.max(1, Math.min(365, Number(proj.deadlineDays)));
+      }
+    }
+    const serverDerivedDueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
+
     let newOrd: Order;
     if (isInquiry) {
       // Chat thread only: nothing is charged and no escrow exists
-      newOrd = { id, title, buyerId, sellerId, amount: 0, status: 'in_progress', createdAt: today, dueDate: req.body.dueDate || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0], gigId: req.body.gigId, projectId: req.body.projectId, ...(requirements ? { requirements } : {}) };
+      newOrd = { id, title, buyerId, sellerId, amount: 0, status: 'in_progress', createdAt: today, dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0], gigId: req.body.gigId, projectId: req.body.projectId, ...(requirements ? { requirements } : {}) };
     } else {
       // Debits the buyer wallet into escrow. Throws (and creates nothing) if the balance is too low.
       financeLedger.fundEscrow({ orderId: id, orderTitle: title, amount: rawAmount, buyerId, sellerId, actor: `user:${buyerId}` });
       newOrd = {
         id, title, buyerId, sellerId, amount: rawAmount, status: 'funded_in_escrow', createdAt: today,
-        dueDate: req.body.dueDate || new Date(Date.now() + 10 * 86400000).toISOString().split('T')[0],
+        dueDate: serverDerivedDueDate,
         escrowProtectionStartDate: today,
         escrowProtectionEndDate: new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0],
         gigId: req.body.gigId, projectId: req.body.projectId,
@@ -5998,12 +6028,14 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
           }
         }
       }
+
+      // Perform the required financial release successfully first
+      releaseOrderFunds(order, caller.name, `Final invoice ${offer.number} accepted by buyer and escrow released`);
+
+      // Only after successful release, mark the invoice offer as paid/resolved
       offer.status = 'paid';
       offer.resolvedAt = now;
       offer.resolvedBy = caller.id;
-
-      // Immediately release escrow funds to the seller upon buyer accepting the final invoice
-      releaseOrderFunds(order, caller.name, `Final invoice ${offer.number} accepted by buyer and escrow released`);
 
       syncUserBalances();
       saveOffersToDisk();
@@ -6331,6 +6363,9 @@ app.patch('/api/admin/disputes/:id/resolve', requireAdmin, (req, res) => {
       details: `Resolved dispute with status ${status}. Notes: ${notes}`,
       timestamp: new Date().toLocaleString()
     });
+    saveDisputesToDisk();
+    saveOrdersToDisk();
+    saveRefundsToDisk();
     res.json(d);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -6462,6 +6497,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
           const dbUser = users.find(u => u.id === payload.id);
           if (dbUser && dbUser.status === 'active') {
             (ws as any).authenticatedUserId = dbUser.id;
+            (ws as any).sessionVersion = payload.sessionVersion !== undefined ? payload.sessionVersion : dbUser.sessionVersion;
             (ws as any).isAuthenticated = true;
             clearTimeout(authTimeout);
             
@@ -6482,6 +6518,13 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
       // Block all other messages until authenticated
       if (!(ws as any).isAuthenticated) {
         ws.send(JSON.stringify({ error: 'Authentication required' }));
+        return;
+      }
+
+      // Validate session version and status
+      const currentDbUser = users.find(u => u.id === (ws as any).authenticatedUserId);
+      if (!currentDbUser || currentDbUser.status !== 'active' || (currentDbUser.sessionVersion !== undefined && (ws as any).sessionVersion !== undefined && currentDbUser.sessionVersion !== (ws as any).sessionVersion)) {
+        try { ws.close(4401, 'Session invalidated or account inactive'); } catch {}
         return;
       }
 

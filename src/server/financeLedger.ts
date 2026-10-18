@@ -537,7 +537,7 @@ export class FinanceLedgerEngine {
   public ensureWallet(params: { userId: string; name: string; email: string; role: 'buyer' | 'freelancer' }): void {
     const existing = this.wallets.get(params.userId);
     if (existing) {
-      if (existing.userRole !== params.role) {
+      if (existing.userRole !== params.role || existing.userName !== params.name || existing.userEmail !== params.email) {
         existing.userRole = params.role;
         existing.userName = params.name;
         existing.userEmail = params.email;
@@ -1237,7 +1237,9 @@ export class FinanceLedgerEngine {
         }
       };
 
-      fs.writeFileSync(LEDGER_FILE, JSON.stringify(data, null, 2), 'utf-8');
+      const tempFile = path.join(DATA_DIR, `financial_ledger.json.tmp.${randomUUID()}`);
+      fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf-8');
+      fs.renameSync(tempFile, LEDGER_FILE);
     } catch (err) {
       console.error('Failed to save financial ledger to disk:', err);
     }
@@ -1251,15 +1253,15 @@ export class FinanceLedgerEngine {
       const raw = fs.readFileSync(LEDGER_FILE, 'utf-8');
       const data = JSON.parse(raw);
 
-      if (data.journals) this.journals = data.journals;
-      if (data.transactions) this.transactions = data.transactions;
-      if (data.wallets) this.wallets = new Map(data.wallets);
-      if (data.auditLogs) this.auditLogs = data.auditLogs;
-      if (data.exceptions) this.exceptions = data.exceptions;
-      if (data.idempotencyKeys) this.idempotencyKeys = new Set(data.idempotencyKeys);
-      if (data.escrows) this.escrows = new Map(data.escrows);
-      if (data.payouts) this.payouts = new Map(data.payouts);
-      if (data.opResults) this.opResults = new Map(data.opResults);
+      if (data.journals && Array.isArray(data.journals)) this.journals = data.journals;
+      if (data.transactions && Array.isArray(data.transactions)) this.transactions = data.transactions;
+      if (data.wallets && Array.isArray(data.wallets)) this.wallets = new Map(data.wallets);
+      if (data.auditLogs && Array.isArray(data.auditLogs)) this.auditLogs = data.auditLogs;
+      if (data.exceptions && Array.isArray(data.exceptions)) this.exceptions = data.exceptions;
+      if (data.idempotencyKeys && Array.isArray(data.idempotencyKeys)) this.idempotencyKeys = new Set(data.idempotencyKeys);
+      if (data.escrows && Array.isArray(data.escrows)) this.escrows = new Map(data.escrows);
+      if (data.payouts && Array.isArray(data.payouts)) this.payouts = new Map(data.payouts);
+      if (data.opResults && Array.isArray(data.opResults)) this.opResults = new Map(data.opResults);
 
       if (data.config) {
         this.platformCommissionRate = data.config.platformCommissionRate ?? this.platformCommissionRate;
@@ -1272,7 +1274,7 @@ export class FinanceLedgerEngine {
         this.maximumWithdrawalAmount = data.config.maximumWithdrawalAmount ?? this.maximumWithdrawalAmount;
       }
     } catch (err) {
-      console.error('Failed to load financial ledger from disk:', err);
+      console.error('Failed to load financial ledger from disk (retaining valid in-memory state):', err);
     }
   }
 

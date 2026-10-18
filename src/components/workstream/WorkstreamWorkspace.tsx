@@ -96,7 +96,8 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
   useEffect(() => {
     if (!lastMessage || lastMessage.id === handledOfferMsgRef.current) return;
     handledOfferMsgRef.current = lastMessage.id;
-    if (['offer_accepted', 'offer_paid'].includes(lastMessage.metadata?.action)) onOrderChanged?.(null);
+    const action = lastMessage.metadata?.action;
+    if (action && ['offer_accepted', 'offer_paid'].includes(action)) onOrderChanged?.(null);
   }, [lastMessage?.id]);
 
   const handleOfferAction = async (offerId: string, action: 'accept' | 'decline' | 'cancel') => {

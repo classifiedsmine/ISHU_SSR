@@ -154,12 +154,12 @@ export const DEFAULT_SITE_SETTINGS: SiteSettingsState = {
   memberships: {
     membershipsEnabled: true,
     freelancerPlans: [
-      { id: 'plan_free', name: 'Standard Freelancer', priceMonthly: 0, bidsPerMonth: 15, commissionDiscountPercent: 0, featuredBadge: false, enabled: true },
-      { id: 'plan_pro', name: 'WorkPerHour Pro Talent', priceMonthly: 29, bidsPerMonth: 80, commissionDiscountPercent: 2, featuredBadge: true, enabled: true }
+      { id: 'plan_free', name: 'Standard Freelancer', priceMonthly: 0, bidsPerMonth: 0, commissionDiscountPercent: 0, featuredBadge: false, enabled: true },
+      { id: 'plan_pro', name: 'WorkPerHour Pro Talent', priceMonthly: 29, bidsPerMonth: 0, commissionDiscountPercent: 2, featuredBadge: true, enabled: true }
     ],
     buyerPlans: [
-      { id: 'buyer_free', name: 'Standard Client', priceMonthly: 0, jobPostsPerMonth: 10, zeroBuyerFee: false, enabled: true },
-      { id: 'buyer_enterprise', name: 'Enterprise Client', priceMonthly: 99, jobPostsPerMonth: 999, zeroBuyerFee: true, enabled: true }
+      { id: 'buyer_free', name: 'Standard Client', priceMonthly: 0, jobPostsPerMonth: 0, zeroBuyerFee: false, enabled: true },
+      { id: 'buyer_enterprise', name: 'Enterprise Client', priceMonthly: 99, jobPostsPerMonth: 0, zeroBuyerFee: true, enabled: true }
     ]
   },
   marketplace: {
