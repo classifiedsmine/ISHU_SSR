@@ -603,7 +603,8 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     setIsReviewModalOpen,
     handleSubmitReview,
     reviewError,
-    isSubmittingReview
+    isSubmittingReview,
+    escrowError
   } = useWorkstream({ 
     orders, usersList, gigs, messages, currentUser, impersonatedUser,
     workstreamTab, starredWorkstreams, selectedPersonFilter, projectFilterSearch, workstreamSearch,
@@ -4063,6 +4064,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
                     handleSubmitReview={handleSubmitReview}
                     reviewError={reviewError}
                     isSubmittingReview={isSubmittingReview}
+                    escrowError={escrowError}
                     onViewPartnerProfile={(user) => navigate('/' + (user.username || slugify(user.name)))}
                     onDisputeAssistance={() => navigate('/admin')}
                     onOrderChanged={() => refresh()}

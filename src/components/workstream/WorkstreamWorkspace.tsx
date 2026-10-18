@@ -46,6 +46,7 @@ interface WorkstreamWorkspaceProps {
   handleSubmitReview: (review: { rating: number; comment: string; gigId?: string; projectId?: string }) => Promise<boolean>;
   reviewError?: string | null;
   isSubmittingReview?: boolean;
+  escrowError?: string | null;
 }
 
 export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
@@ -72,7 +73,8 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
   setIsReviewModalOpen,
   handleSubmitReview,
   reviewError,
-  isSubmittingReview
+  isSubmittingReview,
+  escrowError
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<WorkstreamSubTab>('activity');
   const [isReleaseModalOpen, setIsReleaseModalOpen] = useState(false);
@@ -84,10 +86,11 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
   const lastMessageId = messages.length ? messages[messages.length - 1].id : '';
   const { offers, currencySymbol, escrowFunded, createOffer, respond } = useWorkstreamOffers(order.id, lastMessageId);
   const isSeller = !!currentUser && currentUser.id === order.sellerId;
-  const canSendProposal = isSeller && !escrowFunded && order.status === 'in_progress';
-  const canRaiseInvoice = isSeller && escrowFunded && order.status !== 'cancelled';
-  const proposalHint = !isSeller ? 'Only the seller can send this' : 'Escrow is already funded. Use Raise Invoice for extra work.';
-  const invoiceHint = !isSeller ? 'Only the seller can send this' : 'Invoices are for follow-on work once escrow is funded.';
+  const pendingInvoice = offers.find(o => o.kind === 'invoice' && o.status === 'pending');
+  const canSendProposal = isSeller && !pendingInvoice;
+  const canRaiseInvoice = isSeller && order.status === 'in_progress';
+  const proposalHint = !isSeller ? 'Only the seller can send this' : 'Cannot send proposal while an invoice is pending.';
+  const invoiceHint = !isSeller ? 'Only the seller can send this' : 'Invoices are for follow-on work.';
 
   // When an offer is accepted/paid the order changes (escrow funded, or a new invoice order appears).
   // The buyer's click already refreshes, but the seller only sees the system message, so refresh on it too.
@@ -438,9 +441,10 @@ export const WorkstreamWorkspace: React.FC<WorkstreamWorkspaceProps> = ({
         key={`release_${order.id}`}
         isOpen={isReleaseModalOpen}
         order={order}
-        pendingInvoice={offers.find(o => o.kind === 'invoice' && o.status === 'pending')}
+        pendingInvoice={pendingInvoice}
+        error={escrowError}
         onClose={() => setIsReleaseModalOpen(false)}
-        onConfirm={async () => { await onReleaseEscrow(); }}
+        onConfirm={async () => { return await onReleaseEscrow(); }}
       />
 
       <WorkstreamDeliverModal

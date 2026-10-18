@@ -9,6 +9,7 @@ interface WorkstreamReleaseModalProps {
   onReleaseEscrow?: () => boolean | void | Promise<boolean | void>;
   onConfirm?: () => boolean | void | Promise<boolean | void>;
   pendingInvoice?: WorkstreamOffer;
+  error?: string | null;
 }
 
 export const WorkstreamReleaseModal: React.FC<WorkstreamReleaseModalProps> = ({
@@ -17,7 +18,8 @@ export const WorkstreamReleaseModal: React.FC<WorkstreamReleaseModalProps> = ({
   onClose,
   onReleaseEscrow,
   onConfirm,
-  pendingInvoice
+  pendingInvoice,
+  error: propError
 }) => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -102,10 +104,10 @@ export const WorkstreamReleaseModal: React.FC<WorkstreamReleaseModalProps> = ({
             </div>
           )}
 
-          {error && (
+          {(error || propError) && (
             <div className="p-3 bg-red-50/80 text-[11px] text-red-700 rounded-2xl border border-red-200 flex items-start gap-2.5">
               <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-              <span>{error}</span>
+              <span>{error || propError}</span>
             </div>
           )}
 

@@ -1429,7 +1429,6 @@ function seedPasswordHashFor(role: string): string {
 // Initial Data Seeds & Persistent Storage Engine
 export let users: User[] = SEED_USERS.map(u => ({
   ...u,
-  password: seedPasswordHashFor(u.role),
   sessionVersion: u.sessionVersion || 1,
   knownDevices: u.knownDevices || ['dev_default_session']
 }));
@@ -4454,7 +4453,7 @@ function recalculateUserRating(userId: string) {
   if (publicUserReviews.length > 0) {
     targetUser.rating = Number((publicUserReviews.reduce((sum, r) => sum + r.rating, 0) / publicUserReviews.length).toFixed(1));
   } else {
-    targetUser.rating = 5.0;
+    targetUser.rating = 0;
   }
 }
 
