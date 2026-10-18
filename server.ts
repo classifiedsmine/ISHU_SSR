@@ -1938,8 +1938,8 @@ const handlePostSiteSettings = (req: Request, res: Response) => {
   }
 };
 
-app.get('/api/admin/settings', handleGetSiteSettings);
-app.get('/api/admin/site-settings', handleGetSiteSettings);
+app.get('/api/admin/settings', requireAdmin, handleGetSiteSettings);
+app.get('/api/admin/site-settings', requireAdmin, handleGetSiteSettings);
 // Fee settings control real money movement: only administrators may change them.
 app.post('/api/admin/settings', requireAdmin, handlePostSiteSettings);
 app.patch('/api/admin/settings', requireAdmin, handlePostSiteSettings);
@@ -2871,7 +2871,7 @@ app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
     const reason = String(req.body.reason || 'Admin administrative force-release in seller favor.');
     const result = releaseOrderFunds(order, adminActor(req), reason, req.body.requestKey);
     closeActiveDispute(order.id, 'resolved_release', reason);
-    pushSystemMessage(order.id, `✅ Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`);
+    pushSystemMessage(order.id, `✅ Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`, 'order_completed');
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2901,12 +2901,12 @@ app.post('/api/orders/:id/force-cancel', requireAdmin, (req, res) => {
       refundAmount = Number(req.body.customAmount);
       result = splitOrderFunds(order, refundAmount, adminActor(req), reason);
       closeActiveDispute(order.id, 'resolved_partial', reason);
-      pushSystemMessage(order.id, `⚖️ Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`);
+      pushSystemMessage(order.id, `⚖️ Order resolved by Administration. $${refundAmount} refunded to buyer; the remainder was released to the freelancer. Reason: ${reason}`, 'dispute_resolved');
     } else {
       result = refundOrderFunds(order, undefined, adminActor(req), reason, req.body.requestKey);
       refundAmount = result.refunded;
       closeActiveDispute(order.id, 'resolved_refund', reason);
-      pushSystemMessage(order.id, `🚨 Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${reason}`);
+      pushSystemMessage(order.id, `🚨 Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${reason}`, 'order_cancelled');
     }
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
   } catch (err: any) {
@@ -6209,10 +6209,11 @@ app.patch('/api/admin/users/:id/status', requireAdmin, (req, res) => {
   const oldStatus = u.status;
   u.status = req.body.status;
 
+  const admin = (req as any).authenticatedUser;
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: admin?.name || 'Admin',
+    role: admin?.role || 'admin',
     action: `USER_STATUS_${req.body.status.toUpperCase()}`,
     target: `User ${u.name}`,
     details: `Changed account status from ${oldStatus} to ${req.body.status}`,
@@ -6240,10 +6241,11 @@ app.post('/api/admin/users/:id/impersonate', requireAdmin, (req, res) => {
   const u = users.find(user => user.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'User not found' });
 
+  const admin = (req as any).authenticatedUser;
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: admin?.name || 'Admin',
+    role: admin?.role || 'admin',
     action: 'USER_IMPERSONATED',
     target: `User ${u.name}`,
     details: `Initialized administrative impersonation session for ${u.email}`,
@@ -6260,10 +6262,11 @@ app.post('/api/admin/users/:id/stop-impersonate', requireAdmin, (req, res) => {
   const u = users.find(user => user.id === req.params.id);
   if (!u) return res.status(404).json({ error: 'User not found' });
 
+  const admin = (req as any).authenticatedUser;
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: admin?.name || 'Admin',
+    role: admin?.role || 'admin',
     action: 'USER_IMPERSONATION_ENDED',
     target: `User ${u.name}`,
     details: `Safely ended administrative impersonation session for ${u.email}`,
@@ -6278,10 +6281,11 @@ app.patch('/api/admin/users/:id/verify', requireAdmin, (req, res) => {
   if (!u) return res.status(404).json({ error: 'User not found' });
   u.verified = !u.verified;
 
+  const admin = (req as any).authenticatedUser;
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: admin?.name || 'Admin',
+    role: admin?.role || 'admin',
     action: u.verified ? 'USER_VERIFIED' : 'USER_UNVERIFIED',
     target: `User ${u.name}`,
     details: `Verification status changed to ${u.verified}`,
@@ -6296,6 +6300,9 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
   if (index === -1) return res.status(404).json({ error: 'User not found' });
 
   const target = users[index];
+  if (target.role === 'super_admin') {
+    return res.status(403).json({ error: 'Cannot delete a super_admin account.' });
+  }
   if (financeLedger.hasOutstandingFunds(target.id)) {
     return res.status(409).json({ error: 'User still has wallet funds, pending withdrawals or active escrow. Resolve these before deleting the account.' });
   }
@@ -6309,10 +6316,11 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
   gigs = gigs.filter(g => g.freelancerId !== req.params.id);
   projects = projects.filter(p => p.buyerId !== req.params.id);
 
+  const admin = (req as any).authenticatedUser;
   registerAuditLog({
     id: 'log_' + Date.now(),
-    actor: 'Admin Chief',
-    role: 'super_admin',
+    actor: admin?.name || 'Admin',
+    role: admin?.role || 'admin',
     action: 'USER_DELETED',
     target: `User ${deletedUser.name}`,
     details: `Permanently deleted user account ${deletedUser.email} and cleared their associated gigs & projects`,
