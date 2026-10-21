@@ -2551,6 +2551,7 @@ app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
     postgresStore.saveOrders(orders);
     postgresStore.saveDisputes(disputes);
     broadcastMessage(sysMsg, order.id);
+    notifyOrderParties(order.id, 'dispute_opened', sysMsg.text, sysMsg.id);
 
     res.json({ success: true, dispute: newDispute, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
@@ -4321,6 +4322,7 @@ function recalculateUserRating(userId: string) {
   } else {
     targetUser.rating = 0;
   }
+  saveUsersToPostgres();
 }
 
 function sanitizePublicReview(r: Review): Review {
@@ -4448,7 +4450,7 @@ app.post('/api/reviews', requireAuth, (req, res) => {
     type: 'review',
     title: 'New Review Received',
     message: `${caller.name} left a ${numRating}-star review for order "${order.title}".`,
-    link: `/orders/${order.id}`,
+    link: `/messages/${order.id}`,
     dedupKey: `review_${newReview.id}`,
     actorId: caller.id
   });
@@ -5075,7 +5077,7 @@ app.post('/api/messages', requireAuth, (req, res) => {
       type: 'message',
       title: 'New Message',
       message: `${caller.name} sent a message regarding order "${order.title}".`,
-      link: `/orders/${order.id}`,
+      link: `/messages/${order.id}`,
       dedupKey: `msg_${newMsg.id}`,
       actorId: caller.id
     });
@@ -5738,6 +5740,7 @@ async function processProposalAccept(req: any, res: any) {
 
       const offerIdx = workstreamOffers.findIndex(o => o.id === offer.id);
       if (offerIdx !== -1) workstreamOffers.splice(offerIdx, 1);
+      postgresStore.saveOffers(workstreamOffers).catch(err => console.error('[OfferRollback] Failed to persist:', err));
 
       for (let i = messages.length - 1; i >= 0; i--) {
         if (messages[i].orderId === order.id) {
@@ -6076,6 +6079,26 @@ function postOfferMessage(order: Order, offer: WorkstreamOffer, sender: { id: st
   recordMessage(msg);
   postgresStore.saveMessages(messages);
   broadcastMessage(msg, order.id);
+
+  const recipientIds: string[] = [];
+  if (sender?.id) {
+    const other = sender.id === order.buyerId ? order.sellerId : order.buyerId;
+    if (other) recipientIds.push(other);
+  } else {
+    if (order.buyerId) recipientIds.push(order.buyerId);
+    if (order.sellerId && order.sellerId !== order.buyerId) recipientIds.push(order.sellerId);
+  }
+  for (const userId of recipientIds) {
+    createNotification({
+      userId,
+      type: 'offer',
+      title: 'New Offer Activity',
+      message: text,
+      link: `/messages/${order.id}`,
+      dedupKey: `offer_${action}_${msg.id}`,
+      actorId: sender?.id
+    });
+  }
 }
 
 function offerCaller(req: Request) {
@@ -6915,6 +6938,36 @@ function broadcastMessage(message: Message, orderId: string) {
   }
 }
 
+  function notifyOrderParties(orderId: string, action: string, text: string, msgId: string) {
+    const order = orders.find(o => o.id === orderId);
+    if (!order) return;
+    const map: Record<string, { to: ('buyer'|'seller')[]; title: string }> = {
+      order_created:        { to: ['seller'],           title: 'New Order Received' },
+      escrow_funded:        { to: ['seller'],           title: 'Order Funded' },
+      deliverable_approved: { to: ['seller'],           title: 'Delivery Approved' },
+      revision_requested:   { to: ['seller'],           title: 'Revision Requested' },
+      revision_resolved:    { to: ['buyer'],            title: 'Revision Delivered' },
+      escrow_released:      { to: ['seller'],           title: 'Payment Released' },
+      escrow_refunded:      { to: ['buyer'],            title: 'Refund Issued' },
+      order_completed:      { to: ['buyer', 'seller'],  title: 'Order Completed' },
+      dispute_opened:       { to: ['buyer', 'seller'],  title: 'Dispute Opened' },
+      dispute_resolved:     { to: ['buyer', 'seller'],  title: 'Dispute Resolved' },
+    };
+    const rule = map[action];
+    if (!rule) return;
+    for (const who of rule.to) {
+      const userId = who === 'buyer' ? order.buyerId : order.sellerId;
+      createNotification({
+        userId,
+        type: 'order',
+        title: rule.title,
+        message: text,
+        link: `/messages/${orderId}`,
+        dedupKey: `${action}_${msgId}_${userId}`
+      });
+    }
+  }
+
 function emitSystemEvent(orderId: string, action: string, text: string, metadata: Record<string, any> = {}) {
   const sysMsg: Message = {
     id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
@@ -6929,6 +6982,7 @@ function emitSystemEvent(orderId: string, action: string, text: string, metadata
   recordMessage(sysMsg);
   postgresStore.saveMessages(messages);
   broadcastMessage(sysMsg, orderId);
+  notifyOrderParties(orderId, action, text, sysMsg.id);
 }
 
 function disconnectUserSockets(userId: string, reason = 'Session invalidated') {

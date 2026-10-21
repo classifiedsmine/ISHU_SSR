@@ -801,7 +801,7 @@ export class PostgresStore {
   // --- WORKSPACES ---
   async saveWorkspaces(workspaces: any[]): Promise<void> {
     return this.withLock('workspaces', async () => {
-      if (!workspaces || workspaces.length === 0) return;
+      if (!workspaces) return;
       const client = await this.getPool().connect();
       try {
         await client.query('BEGIN');
@@ -839,6 +839,12 @@ export class PostgresStore {
             ]
           );
         }
+        if (seen.size > 0) {
+          const placeholders = Array.from(seen).map((_, i) => `$${i + 1}`).join(',');
+          await client.query(`DELETE FROM workspaces WHERE workspace_id NOT IN (${placeholders})`, Array.from(seen));
+        } else {
+          await client.query('DELETE FROM workspaces');
+        }
         await client.query('COMMIT');
       } catch (e) {
         await client.query('ROLLBACK');
@@ -875,7 +881,7 @@ export class PostgresStore {
   // --- OFFERS ---
   async saveOffers(offers: WorkstreamOffer[]): Promise<void> {
     return this.withLock('offers', async () => {
-      if (!offers || offers.length === 0) return;
+      if (!offers) return;
       const client = await this.getPool().connect();
       try {
         await client.query('BEGIN');
@@ -908,6 +914,12 @@ export class PostgresStore {
               o.resolvedAt || null, o.resolvedBy || null, JSON.stringify(o.metadata || null)
             ]
           );
+        }
+        if (seen.size > 0) {
+          const placeholders = Array.from(seen).map((_, i) => `$${i + 1}`).join(',');
+          await client.query(`DELETE FROM workstream_offers WHERE id NOT IN (${placeholders})`, Array.from(seen));
+        } else {
+          await client.query('DELETE FROM workstream_offers');
         }
         await client.query('COMMIT');
       } catch (e) {

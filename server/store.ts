@@ -5,6 +5,8 @@ import { randomBytes } from 'crypto';
 import bcrypt from 'bcryptjs';
 import { financeLedger } from '../src/server/financeLedger.js';
 import { siteSettings, DEFAULT_SITE_SETTINGS } from '../src/server/siteSettings.js';
+import { workspaceService } from '../src/server/workspaceService.js';
+import { paymentGatewayManager } from '../src/server/paymentGateways.js';
 import { OrderFeeBreakdown } from '../src/shared/fees.js';
 
 export { financeLedger, siteSettings, DEFAULT_SITE_SETTINGS };
@@ -393,7 +395,7 @@ export function syncUserBalances() {
 export function ensureWallet(userId: string) {
   const u = users.find(x => x.id === userId);
   if (!u || u.role === 'admin' || u.role === 'super_admin') return;
-  const isFreelancer = gigs.some(g => g.freelancerId === u.id) || orders.some(o => o.sellerId === u.id) || u.role === 'freelancer';
+  const isFreelancer = gigs.some(g => g.freelancerId === u.id) || orders.some(o => o.sellerId === u.id) || u.role === 'freelancer' || u.role === 'seller';
   financeLedger.ensureWallet({ userId: u.id, name: u.name, email: u.email, role: isFreelancer ? 'freelancer' : 'buyer' });
 }
 
@@ -509,7 +511,28 @@ export async function hydrateStoreFromPostgres() {
       const loadedSettings = await postgresStore.loadSiteSettings();
       if (loadedSettings) {
         Object.assign(siteFeeSettings, loadedSettings);
+        siteSettings.loadFromState(loadedSettings);
       }
+
+      const loadedWorkspaces = await postgresStore.listWorkspaces();
+      if (loadedWorkspaces && loadedWorkspaces.length > 0) {
+        workspaceService.loadFromList(loadedWorkspaces);
+      }
+
+      const loadedOffers = await postgresStore.listOffers();
+      if (loadedOffers && loadedOffers.length > 0) {
+        workstreamOffers.length = 0;
+        workstreamOffers.push(...loadedOffers);
+      }
+
+      const loadedInvoices = await postgresStore.listCustomInvoices();
+      if (loadedInvoices && loadedInvoices.length > 0) {
+        customInvoices.length = 0;
+        customInvoices.push(...loadedInvoices);
+      }
+
+      const loadedGateways = await postgresStore.loadPaymentGateways();
+      if (loadedGateways) paymentGatewayManager.loadFromState(loadedGateways);
 
       const loadedLedger = await postgresStore.loadLedgerState();
       if (loadedLedger) {

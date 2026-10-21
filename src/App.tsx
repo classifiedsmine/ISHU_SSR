@@ -100,6 +100,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
   const [impersonatedUser, setImpersonatedUser] = useState<UserAccount | null>(null);
 
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
+  const [errorToast, setErrorToast] = useState<string | null>(null);
 
   const updateCurrentUser = (u: UserAccount | null | ((prev: UserAccount | null) => UserAccount | null)) => {
     setCurrentUser(prev => {
@@ -129,6 +130,27 @@ export default function App({ initialPath, initialData }: { initialPath?: string
       } catch {}
     }
   }, []);
+
+  useEffect(() => {
+    const handleAppNotify = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail) {
+        setErrorToast(detail);
+      }
+    };
+    window.addEventListener('app:notify', handleAppNotify as EventListener);
+    return () => {
+      window.removeEventListener('app:notify', handleAppNotify as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!errorToast) return;
+    const timer = setTimeout(() => {
+      setErrorToast(null);
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [errorToast]);
 
   // Custom Data Hook
   const {
@@ -1775,10 +1797,20 @@ export default function App({ initialPath, initialData }: { initialPath?: string
           dueDate: new Date(Date.now() + 10 * 86400000).toISOString().split('T')[0]
         })
       });
-      const newOrd = await res.json();
+      let newOrd: any;
+      try {
+        newOrd = await res.json();
+      } catch {
+        window.alert('Could not place the order. Please try again.');
+        return;
+      }
       if (!res.ok) {
         // e.g. insufficient wallet balance: nothing was created or charged
-        window.alert(newOrd?.error || 'Could not place the order.');
+        let errText = newOrd?.error || 'Could not place the order.';
+        if (errText.includes('Insufficient')) {
+          errText += ' Add funds to your wallet and try again.';
+        }
+        window.alert(errText);
         return;
       }
       setOrders(prev => [newOrd, ...prev]);
@@ -1788,6 +1820,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
       navigate(`/messages/${newOrd.id}`);
     } catch (err) {
       console.error(err);
+      window.alert('Network error while placing the order. Please try again.');
     }
   };
 
@@ -4577,6 +4610,20 @@ export default function App({ initialPath, initialData }: { initialPath?: string
           <span className="text-xs font-bold">{deleteSuccessToast}</span>
           <button 
             onClick={() => setDeleteSuccessToast(null)}
+            className="text-slate-400 hover:text-white text-xs font-bold ml-2 cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* ERROR TOAST */}
+      {errorToast && (
+        <div className="fixed bottom-6 right-6 z-50 bg-slate-900 text-white px-4 py-3 rounded-2xl shadow-2xl flex items-center gap-3 border border-red-500/30 animate-in slide-in-from-bottom duration-200">
+          <div className="w-2 h-2 rounded-full bg-red-500 shrink-0 animate-pulse" />
+          <span className="text-xs font-bold text-red-200">{errorToast}</span>
+          <button 
+            onClick={() => setErrorToast(null)}
             className="text-slate-400 hover:text-white text-xs font-bold ml-2 cursor-pointer"
           >
             ✕
