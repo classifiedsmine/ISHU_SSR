@@ -100,8 +100,16 @@ export function Footer({ navigate }: FooterProps) {
                 <span>Admin Panel Console</span>
               </a>
             </li>
-            <li><span className="text-slate-400">Escrow Security Protocols</span></li>
-            <li><span className="text-slate-400">Gemini AI Engine Logs</span></li>
+            <li>
+              <button onClick={(e) => navigate('/support', e)} className="text-slate-500 hover:text-emerald-600 transition-colors cursor-pointer text-left">
+                Escrow Security Protocols
+              </button>
+            </li>
+            <li>
+              <button onClick={(e) => navigate('/support', e)} className="text-slate-500 hover:text-emerald-600 transition-colors cursor-pointer text-left">
+                Gemini AI Engine
+              </button>
+            </li>
           </ul>
         </div>
       </div>
@@ -119,19 +127,23 @@ export function Footer({ navigate }: FooterProps) {
           <span>·</span>
           <button 
             onClick={(e) => navigate('/switch-user', e)}
-            className="font-semibold text-fiverr-dark hover:text-fiverr-dark inline-flex items-center gap-1 cursor-pointer"
+            className="font-semibold text-fiverr-dark hover:text-emerald-600 inline-flex items-center gap-1 cursor-pointer"
           >
             <Users className="w-3.5 h-3.5 text-emerald-600" />
             <span>Switch User</span>
           </button>
           <span>·</span>
-          <a href="/admin" onClick={(e) => navigate('/admin', e)} className="font-semibold text-fiverr-dark hover:text-fiverr-dark">
+          <a href="/admin" onClick={(e) => navigate('/admin', e)} className="font-semibold text-fiverr-dark hover:text-emerald-600">
             Admin Portal
           </a>
           <span>·</span>
-          <span>Terms of Service</span>
+          <button onClick={(e) => navigate('/support', e)} className="hover:text-emerald-600 cursor-pointer">
+            Terms of Service
+          </button>
           <span>·</span>
-          <span>Privacy Policy</span>
+          <button onClick={(e) => navigate('/support', e)} className="hover:text-emerald-600 cursor-pointer">
+            Privacy Policy
+          </button>
         </div>
       </div>
     </footer>

@@ -38,7 +38,7 @@ export const WorkstreamReleaseModal: React.FC<WorkstreamReleaseModalProps> = ({
     try {
       const releaseFn = onReleaseEscrow || onConfirm;
       const result = releaseFn ? await releaseFn() : undefined;
-      if (result !== false) {
+      if (result === true) {
         onClose();
       }
     } catch (err: any) {

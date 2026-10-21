@@ -4,11 +4,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEFAULT_FEE_CONFIG, calculateOrderFees, percentOfCents, validateFeeConfig, type FeeConfig } from '../shared/fees.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, '../../data');
-const LEDGER_FILE = path.join(DATA_DIR, 'financial_ledger.json');
-
-
 // Authoritative Double-Entry Ledger & Financial Engine for WorkPerHour
 
 export interface ChartOfAccount {
@@ -175,6 +170,7 @@ export interface EscrowRecord {
   refundedTotal: number;
   releasedGross: number;
   refundSeq: number;
+  releaseSeq?: number;
   status: 'held' | 'released' | 'refunded' | 'split';
   fundedAt: string;
   commissionPercent: number; // commission rate locked in when the escrow was funded
@@ -223,7 +219,6 @@ export class FinanceLedgerEngine {
   private maximumWithdrawalAmount: number = 5000;
 
   constructor() {
-    this.seedInitialFinancialData();
     this.loadFromDisk();
   }
 
@@ -326,7 +321,33 @@ export class FinanceLedgerEngine {
   }
 
   private seedInitialFinancialData() {
-    // Clean slate: no initial seeded financial data
+    if (this.wallets.size > 0) return;
+    const initialUsers = [
+      { userId: 'user_1', name: 'Alex Rivera', email: 'alex@example.com', role: 'buyer' as const },
+      { userId: 'user_2', name: 'Elena Rostova', email: 'elena@example.com', role: 'freelancer' as const },
+      { userId: 'user_3', name: 'Marcus Chen', email: 'marcus@example.com', role: 'freelancer' as const },
+      { userId: 'user_4', name: 'Sarah Jenkins', email: 'sarah@example.com', role: 'freelancer' as const }
+    ];
+    const now = nowStr();
+    for (const u of initialUsers) {
+      if (!this.wallets.has(u.userId)) {
+        this.wallets.set(u.userId, {
+          id: `WAL-${u.userId.toUpperCase()}`,
+          userId: u.userId,
+          userName: u.name,
+          userEmail: u.email,
+          userRole: u.role,
+          currency: DEFAULT_CURRENCY,
+          availableBalance: 0,
+          pendingIncoming: 0,
+          fundsOnHold: 0,
+          pendingWithdrawals: 0,
+          status: 'active',
+          lastActivityAt: now,
+          createdAt: now
+        });
+      }
+    }
   }
 
   // ----- core posting ------------------------------------------------------
@@ -381,8 +402,10 @@ export class FinanceLedgerEngine {
       }
     }
     for (const [uid, delta] of deltas) {
-      const w = this.wallets.get(uid);
-      if (!w) throw new Error(`Wallet not found for user ${uid}`);
+      let w = this.wallets.get(uid);
+      if (!w) {
+        throw new Error(`Wallet not found for user ${uid}`);
+      }
       if (FinanceLedgerEngine.round(w.availableBalance + delta) < 0) {
         throw new Error(`Insufficient available balance for ${w.userName}: this posting would overdraw the wallet ($${w.availableBalance.toFixed(2)} available).`);
       }
@@ -628,10 +651,17 @@ export class FinanceLedgerEngine {
     return wallet;
   }
 
+  private ensureOperational() {
+    if (this.loadFailed) {
+      throw new Error('Ledger operational fault: Initial disk load failed. Financial operations are locked to prevent data inconsistency.');
+    }
+  }
+
   // ----- deposits ----------------------------------------------------------
   // Single entry point for money coming in. A payment-gateway webhook should call this with the
   // gateway's event/payment id as idempotencyKey; replays are harmless.
   public creditDeposit(params: { userId: string; amount: number; reference: string; idempotencyKey: string; actor: string; source?: string }) {
+    this.ensureOperational();
     const amount = FinanceLedgerEngine.assertMoney(params.amount, 'Deposit amount');
     const wallet = this.requireWallet(params.userId);
     if (wallet.userRole === 'admin') throw new Error('Deposits to admin wallets are not allowed.');
@@ -663,11 +693,13 @@ export class FinanceLedgerEngine {
 
   // Locks buyer wallet funds in escrow for an order. Fails if the buyer cannot afford it.
   public fundEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; timestamp?: string; skipMinimum?: boolean }) {
+    this.ensureOperational();
     if (!params.orderId) throw new Error('orderId is required.');
+    if (params.buyerId === params.sellerId) throw new Error('Buyers cannot purchase services from themselves.');
     if (this.escrows.has(params.orderId)) throw new Error(`Order ${params.orderId} is already funded.`);
     const amount = FinanceLedgerEngine.assertMoney(params.amount, 'Order amount');
-    if (!params.skipMinimum && this.minimumOrderAmount >= 0 && amount < this.minimumOrderAmount) throw new Error(`Minimum order amount is $${this.minimumOrderAmount.toFixed(2)}.`);
-    if (params.buyerId === params.sellerId) throw new Error('A user cannot place an order with themselves.');
+    const minOrder = this.minimumOrderAmount >= 0 ? this.minimumOrderAmount : 10;
+    if (!params.skipMinimum && amount < minOrder) throw new Error(`Minimum order amount is $${minOrder.toFixed(2)}.`);
     const buyer = this.requireWallet(params.buyerId);
     const seller = this.requireWallet(params.sellerId);
     if (buyer.userRole === 'admin' || seller.userRole === 'admin') throw new Error('Admin wallets cannot take part in orders.');
@@ -711,6 +743,7 @@ export class FinanceLedgerEngine {
       refundedTotal: 0,
       releasedGross: 0,
       refundSeq: 0,
+      releaseSeq: 0,
       status: 'held',
       fundedAt: params.timestamp || nowStr(),
       commissionPercent: this.platformCommissionRate,
@@ -722,14 +755,15 @@ export class FinanceLedgerEngine {
     return { journal, escrow: this.escrows.get(params.orderId)!, fees };
   }
 
-  // Tops up an already funded escrow for an order with additional funds under the same orderId.
+  // Tops up an already funded escrow for an order with additional funds under the same orderId (including follow-on proposals after prior release).
   public topUpEscrow(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; timestamp?: string; skipMinimum?: boolean }) {
+    this.ensureOperational();
     if (!params.orderId) throw new Error('orderId is required.');
     const esc = this.escrows.get(params.orderId);
     if (!esc) {
       return this.fundEscrow(params);
     }
-    if (esc.status !== 'held') throw new Error(`Escrow for order ${params.orderId} is not in held status (${esc.status}).`);
+    if (!['held', 'released', 'split'].includes(esc.status)) throw new Error(`Escrow for order ${params.orderId} cannot be topped up from status "${esc.status}".`);
     const amount = FinanceLedgerEngine.assertMoney(params.amount, 'Top-up amount');
     const buyer = this.requireWallet(params.buyerId);
     const seller = this.requireWallet(params.sellerId);
@@ -756,7 +790,7 @@ export class FinanceLedgerEngine {
       reference: `ORD-${params.orderId}-ESCROW-TOPUP-${Date.now()}`,
       description: `Escrow top-up for Order #${params.orderId} (${params.orderTitle})`,
       eventType: 'ORDER_ESCROW_TOPUP',
-      idempotencyKey: `IDEMP-ORD-TOPUP-${params.orderId}-${Date.now()}`,
+      idempotencyKey: `IDEMP-ORD-TOPUP-${params.orderId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       actor: params.actor,
       timestamp: params.timestamp,
       entries: fundEntries
@@ -764,6 +798,7 @@ export class FinanceLedgerEngine {
     buyer.fundsOnHold = FinanceLedgerEngine.round(buyer.fundsOnHold + amount);
     esc.amount = FinanceLedgerEngine.round(esc.amount + amount);
     esc.remaining = FinanceLedgerEngine.round(esc.remaining + amount);
+    esc.status = 'held';
     esc.serviceFee = FinanceLedgerEngine.round(esc.serviceFee + fees.serviceFee);
     esc.smallOrderFee = FinanceLedgerEngine.round(esc.smallOrderFee + fees.smallOrderFee);
 
@@ -774,6 +809,7 @@ export class FinanceLedgerEngine {
   // Releases everything still held for the order: net to seller, commission to the platform.
   // Can only succeed once per order; repeat calls throw and change nothing.
   public releaseEscrow(params: { orderId: string; actor: string; reason?: string; requestKey?: string }): { journal: LedgerJournal; freelancerNet: number; platformFee: number } {
+    this.ensureOperational();
     const cached = this.replay<{ journal: LedgerJournal; freelancerNet: number; platformFee: number }>(params.requestKey);
     if (cached) return cached;
     const esc = this.escrows.get(params.orderId);
@@ -797,11 +833,15 @@ export class FinanceLedgerEngine {
     if (platformFee > 0) {
       entries.push({ accountCode: '4010', debit: 0, credit: platformFee, currency: DEFAULT_CURRENCY, description: `${commissionRate}% platform commission on Order #${params.orderId}`, orderId: params.orderId });
     }
+    const nextReleaseSeq = (esc.releaseSeq || 0) + 1;
+    const relIdempKey = nextReleaseSeq === 1 ? `IDEMP-REL-${params.orderId}` : `IDEMP-REL-${params.orderId}-${nextReleaseSeq}`;
+    const relRef = nextReleaseSeq === 1 ? `ORD-${params.orderId}-RELEASE` : `ORD-${params.orderId}-RELEASE-${nextReleaseSeq}`;
+
     const journal = this.postJournal({
-      reference: `ORD-${params.orderId}-RELEASE`,
+      reference: relRef,
       description: `Escrow release for Order #${params.orderId} (${esc.orderTitle})`,
       eventType: 'ESCROW_RELEASED_TO_FREELANCER',
-      idempotencyKey: `IDEMP-REL-${params.orderId}`,
+      idempotencyKey: relIdempKey,
       actor: params.actor,
       entries
     });
@@ -809,6 +849,7 @@ export class FinanceLedgerEngine {
     if (buyer) buyer.fundsOnHold = FinanceLedgerEngine.round(Math.max(0, buyer.fundsOnHold - gross));
     esc.releasedGross = FinanceLedgerEngine.round(esc.releasedGross + gross);
     esc.remaining = 0;
+    esc.releaseSeq = nextReleaseSeq;
     esc.status = esc.refundedTotal > 0 ? 'split' : 'released';
     this.audit({ actor: params.actor, action: 'ESCROW_RELEASED', target: `Order #${params.orderId}`, reason: params.reason || `Released $${freelancerNet.toFixed(2)} net to freelancer, $${platformFee.toFixed(2)} platform commission`, journalId: journal.id });
     return this.remember(params.requestKey, { journal, freelancerNet, platformFee });
@@ -816,6 +857,7 @@ export class FinanceLedgerEngine {
 
   // Refunds all (default) or part of what is still held back to the buyer wallet.
   public refundEscrow(params: { orderId: string; amount?: number; reason: string; actor: string; requestKey?: string }): { journal: LedgerJournal; buyerWallet: UserWallet; refunded: number; feesRefunded: number; remaining: number } {
+    this.ensureOperational();
     const cached = this.replay<{ journal: LedgerJournal; buyerWallet: UserWallet; refunded: number; feesRefunded: number; remaining: number }>(params.requestKey);
     if (cached) return cached;
     const why = FinanceLedgerEngine.assertReason(params.reason, 'A refund reason');
@@ -1208,74 +1250,83 @@ export class FinanceLedgerEngine {
   }
 
   // ----- persistence ------------------------------------------------------
+  private loadFailed = false;
+
   private saveToDisk() {
-    if (process.env.NODE_ENV === 'test') return;
+    if (this.loadFailed) {
+      console.warn('Skipping ledger save to disk because initial load failed (preventing file overwrite).');
+      return;
+    }
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-
-      const data = {
-        journals: this.journals,
-        transactions: this.transactions,
-        wallets: Array.from(this.wallets.entries()),
-        auditLogs: this.auditLogs,
-        exceptions: this.exceptions,
-        idempotencyKeys: Array.from(this.idempotencyKeys),
-        escrows: Array.from(this.escrows.entries()),
-        payouts: Array.from(this.payouts.entries()),
-        opResults: Array.from(this.opResults.entries()),
-        config: {
-          platformCommissionRate: this.platformCommissionRate,
-          buyerFeePercent: this.buyerFeePercent,
-          smallOrderFee: this.smallOrderFee,
-          smallOrderThreshold: this.smallOrderThreshold,
-          refundClientFeesOnFullRefund: this.refundClientFeesOnFullRefund,
-          minimumOrderAmount: this.minimumOrderAmount,
-          minimumWithdrawalAmount: this.minimumWithdrawalAmount,
-          maximumWithdrawalAmount: this.maximumWithdrawalAmount
-        }
-      };
-
-      const tempFile = path.join(DATA_DIR, `financial_ledger.json.tmp.${randomUUID()}`);
-      fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), 'utf-8');
-      fs.renameSync(tempFile, LEDGER_FILE);
+      this.persistToPostgres();
     } catch (err) {
-      console.error('Failed to save financial ledger to disk:', err);
+      console.error('Failed to save financial ledger:', err);
+    }
+  }
+
+  public getSerializableState() {
+    return {
+      journals: this.journals,
+      transactions: this.transactions,
+      wallets: Array.from(this.wallets.entries()),
+      auditLogs: this.auditLogs,
+      exceptions: this.exceptions,
+      idempotencyKeys: Array.from(this.idempotencyKeys),
+      escrows: Array.from(this.escrows.entries()),
+      payouts: Array.from(this.payouts.entries()),
+      opResults: Array.from(this.opResults.entries()),
+      config: {
+        platformCommissionRate: this.platformCommissionRate,
+        buyerFeePercent: this.buyerFeePercent,
+        smallOrderFee: this.smallOrderFee,
+        smallOrderThreshold: this.smallOrderThreshold,
+        refundClientFeesOnFullRefund: this.refundClientFeesOnFullRefund,
+        minimumOrderAmount: this.minimumOrderAmount,
+        minimumWithdrawalAmount: this.minimumWithdrawalAmount,
+        maximumWithdrawalAmount: this.maximumWithdrawalAmount
+      }
+    };
+  }
+
+  public persistToPostgres() {
+    try {
+      const state = this.getSerializableState();
+      import('../../server/db/postgresStore.js').then(({ postgresStore }) => {
+        postgresStore.saveLedgerState(state).catch(err => {
+          console.error('[FinanceLedger] Failed to persist state to PostgreSQL:', err);
+        });
+      }).catch(() => {});
+    } catch (err) {
+      console.error('[FinanceLedger] Error initiating postgres persist:', err);
+    }
+  }
+
+  public loadFromState(data: any) {
+    if (!data || typeof data !== 'object') return;
+    if (data.journals && Array.isArray(data.journals)) this.journals = data.journals;
+    if (data.transactions && Array.isArray(data.transactions)) this.transactions = data.transactions;
+    if (data.wallets && Array.isArray(data.wallets)) this.wallets = new Map(data.wallets);
+    if (data.auditLogs && Array.isArray(data.auditLogs)) this.auditLogs = data.auditLogs;
+    if (data.exceptions && Array.isArray(data.exceptions)) this.exceptions = data.exceptions;
+    if (data.idempotencyKeys && Array.isArray(data.idempotencyKeys)) this.idempotencyKeys = new Set(data.idempotencyKeys);
+    if (data.escrows && Array.isArray(data.escrows)) this.escrows = new Map(data.escrows);
+    if (data.payouts && Array.isArray(data.payouts)) this.payouts = new Map(data.payouts);
+    if (data.opResults && Array.isArray(data.opResults)) this.opResults = new Map(data.opResults);
+
+    if (data.config) {
+      this.platformCommissionRate = data.config.platformCommissionRate ?? this.platformCommissionRate;
+      this.buyerFeePercent = data.config.buyerFeePercent ?? this.buyerFeePercent;
+      this.smallOrderFee = data.config.smallOrderFee ?? this.smallOrderFee;
+      this.smallOrderThreshold = data.config.smallOrderThreshold ?? this.smallOrderThreshold;
+      this.refundClientFeesOnFullRefund = data.config.refundClientFeesOnFullRefund ?? this.refundClientFeesOnFullRefund;
+      this.minimumOrderAmount = data.config.minimumOrderAmount ?? this.minimumOrderAmount;
+      this.minimumWithdrawalAmount = data.config.minimumWithdrawalAmount ?? this.minimumWithdrawalAmount;
+      this.maximumWithdrawalAmount = data.config.maximumWithdrawalAmount ?? this.maximumWithdrawalAmount;
     }
   }
 
   public loadFromDisk() {
-    if (process.env.NODE_ENV === 'test') return;
-    try {
-      if (!fs.existsSync(LEDGER_FILE)) return;
-
-      const raw = fs.readFileSync(LEDGER_FILE, 'utf-8');
-      const data = JSON.parse(raw);
-
-      if (data.journals && Array.isArray(data.journals)) this.journals = data.journals;
-      if (data.transactions && Array.isArray(data.transactions)) this.transactions = data.transactions;
-      if (data.wallets && Array.isArray(data.wallets)) this.wallets = new Map(data.wallets);
-      if (data.auditLogs && Array.isArray(data.auditLogs)) this.auditLogs = data.auditLogs;
-      if (data.exceptions && Array.isArray(data.exceptions)) this.exceptions = data.exceptions;
-      if (data.idempotencyKeys && Array.isArray(data.idempotencyKeys)) this.idempotencyKeys = new Set(data.idempotencyKeys);
-      if (data.escrows && Array.isArray(data.escrows)) this.escrows = new Map(data.escrows);
-      if (data.payouts && Array.isArray(data.payouts)) this.payouts = new Map(data.payouts);
-      if (data.opResults && Array.isArray(data.opResults)) this.opResults = new Map(data.opResults);
-
-      if (data.config) {
-        this.platformCommissionRate = data.config.platformCommissionRate ?? this.platformCommissionRate;
-        this.buyerFeePercent = data.config.buyerFeePercent ?? this.buyerFeePercent;
-        this.smallOrderFee = data.config.smallOrderFee ?? this.smallOrderFee;
-        this.smallOrderThreshold = data.config.smallOrderThreshold ?? this.smallOrderThreshold;
-        this.refundClientFeesOnFullRefund = data.config.refundClientFeesOnFullRefund ?? this.refundClientFeesOnFullRefund;
-        this.minimumOrderAmount = data.config.minimumOrderAmount ?? this.minimumOrderAmount;
-        this.minimumWithdrawalAmount = data.config.minimumWithdrawalAmount ?? this.minimumWithdrawalAmount;
-        this.maximumWithdrawalAmount = data.config.maximumWithdrawalAmount ?? this.maximumWithdrawalAmount;
-      }
-    } catch (err) {
-      console.error('Failed to load financial ledger from disk (retaining valid in-memory state):', err);
-    }
+    // Deprecated: Ledger state is now loaded from PostgreSQL via hydrateStoreFromPostgres()
   }
 
   public resetToCleanState() {
@@ -1287,11 +1338,7 @@ export class FinanceLedgerEngine {
     this.escrows.clear();
     this.payouts.clear();
     this.opResults.clear();
-    for (const w of this.wallets.values()) {
-      w.availableBalance = 0;
-      w.fundsOnHold = 0;
-      w.pendingWithdrawals = 0;
-    }
+    this.wallets.clear();
     this.saveToDisk();
   }
 }

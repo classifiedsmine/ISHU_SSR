@@ -1,38 +1,37 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, Suspense, lazy } from 'react';
 import {
   Activity, AlertCircle, Bell, Briefcase, CheckCircle2, ChevronDown, ChevronRight, Clock,
   Filter, Flame, Grid, Heart, HelpCircle, List, Mail, MessageSquare,
   PlusCircle, RefreshCw, Search, Send, Shield, ShieldCheck, Sparkles, Star,
   Trash2, User, Users, Wallet
 } from 'lucide-react';
-import { PaymentsModule } from './components/PaymentsModule';
 import { FreelancerProfileView } from './components/FreelancerProfileView';
-import { InspectUserModal, EditUserProfileModal, EditProfilePage } from './components/profile';
-import { SettingsPage } from './components/SettingsPage';
+import { EditUserProfileModal } from './components/profile/EditUserProfileModal';
 import { HeaderCategoriesNav, PPH_CATEGORIES } from './components/HeaderCategoriesNav';
 import { ViewingGigModal, EditGigModal, DeleteGigModal, CreateGigView, RelatedGigsSection, GigDetailView } from './components/gigs';
-import { FreelancerSearchView, ProjectSearchView, ProjectDetailView } from './components/marketplace';
-import { AdminPage } from './pages/AdminPage';
+import { FreelancerSearchView, ProjectSearchView, ProjectDetailView, BuyerActivityView } from './components/marketplace';
 import { Reviews } from './components/gig_reviews';
 import { useAppData } from './hooks/useAppData';
 import { Header, Footer, ImpersonationBanner } from './layout';
 import { slugify } from './utils/slugify';
 import { getDeviceId } from './utils/deviceId';
 import { RESERVED_ROUTES } from './shared/routes';
-
-import * as DatabaseService from './services/DatabaseService';
-import { initialUsers, initialGigs, initialProjects, initialOrders } from './data/mockData';
-import {
-  WorkstreamSidebar,
-  WorkstreamList,
-  WorkstreamWorkspace,
-  StartWorkstreamModal,
+import type {
   WorkstreamItem,
   WorkstreamFilter,
   SharedFileItem
 } from './components/workstream';
 import { useWorkstream } from './hooks/workstream/useWorkstream';
 import { calculateOrderFees } from './shared/fees';
+
+const AdminPage = lazy(() => import('./pages/AdminPage').then(m => ({ default: m.AdminPage })));
+const PaymentsModule = lazy(() => import('./components/PaymentsModule').then(m => ({ default: m.PaymentsModule })));
+const SettingsPage = lazy(() => import('./components/SettingsPage').then(m => ({ default: m.SettingsPage })));
+const EditProfilePage = lazy(() => import('./components/profile/EditProfilePage').then(m => ({ default: m.EditProfilePage })));
+const WorkstreamSidebar = lazy(() => import('./components/workstream/WorkstreamSidebar').then(m => ({ default: m.WorkstreamSidebar })));
+const WorkstreamList = lazy(() => import('./components/workstream/WorkstreamList').then(m => ({ default: m.WorkstreamList })));
+const WorkstreamWorkspace = lazy(() => import('./components/workstream/WorkstreamWorkspace').then(m => ({ default: m.WorkstreamWorkspace })));
+const StartWorkstreamModal = lazy(() => import('./components/workstream/StartWorkstreamModal').then(m => ({ default: m.StartWorkstreamModal })));
 
 const financeLedger = {
   quoteOrder: (amount: number) => calculateOrderFees(amount)
@@ -105,28 +104,31 @@ export default function App({ initialPath, initialData }: { initialPath?: string
   const updateCurrentUser = (u: UserAccount | null | ((prev: UserAccount | null) => UserAccount | null)) => {
     setCurrentUser(prev => {
       const next = typeof u === 'function' ? u(prev) : u;
-      if (next) {
-        if (typeof window !== 'undefined') localStorage.setItem('current_user', JSON.stringify(next));
-      } else {
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem('current_user');
-          localStorage.removeItem('user');
+      try {
+        if (next) {
+          if (typeof window !== 'undefined') localStorage.setItem('current_user', JSON.stringify(next));
+        } else {
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem('current_user');
+            localStorage.removeItem('user');
+          }
         }
-      }
+      } catch {}
       return next;
     });
   };
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      const cached = localStorage.getItem('current_user') || localStorage.getItem('user');
-      const token = getAuthToken();
-      if (cached && token) {
-        try { setCurrentUser(JSON.parse(cached)); } catch(e) {}
-      }
+      try {
+        const cached = localStorage.getItem('current_user') || localStorage.getItem('user');
+        const token = getAuthToken();
+        if (cached && token) {
+          setCurrentUser(JSON.parse(cached));
+        }
+      } catch {}
     }
   }, []);
-
 
   // Custom Data Hook
   const {
@@ -134,6 +136,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     gigs, setGigs,
     projects, setProjects,
     proposals, setProposals,
+    offers, setOffers,
     orders, setOrders,
     reviews: appReviews, setReviews: setAppReviews,
     messages, setMessages,
@@ -150,6 +153,10 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     escrowProtectionDays, setEscrowProtectionDays,
     refresh, userEmails, setUserEmails, fetchUserEmails
   } = useAppData(initialData);
+
+  useEffect(() => {
+    refresh();
+  }, [currentUser, refresh]);
 
 
   // Search & Filter
@@ -446,95 +453,110 @@ export default function App({ initialPath, initialData }: { initialPath?: string
   const reservedRoutes = RESERVED_ROUTES;
 
   // Route matching
-  const pathParts = path.split('/').filter(Boolean);
+  const cleanPath = path.split('?')[0] || '/';
+  const pathParts = cleanPath.split('/').filter(Boolean);
 
-  const isCategoryRoute = path.startsWith('/categories/');
-  const categorySlug = isCategoryRoute ? path.replace('/categories/', '') : null;
+  const isCategoryRoute = cleanPath.startsWith('/categories/');
+  const categorySlug = isCategoryRoute ? cleanPath.replace('/categories/', '').split('/')[0] : null;
   const currentCategory = categorySlug ? (SLUG_TO_CATEGORY[categorySlug] || 'All') : 'All';
 
-  const isProjectsList = path === '/projects' || path.startsWith('/projects?') || path === '/search-projects' || path === '/project-search' || path === '/freelance-jobs';
-  const isFreelancersPage = path === '/freelancers' || path.startsWith('/freelancers') || path === '/search-freelancers' || path === '/freelancer-search';
-  const isOrders = path === '/orders';
-  const isMessages = path.startsWith('/messages') || path.startsWith('/workstream') || path.startsWith('/workstreams') || path.startsWith('/workspace');
-  const messageOrderId = path.startsWith('/messages/') 
-    ? path.split('/')[2] 
-    : path.startsWith('/workstreams/') 
-    ? path.split('/')[2] 
-    : path.startsWith('/workstream/') 
-    ? path.split('/')[2] 
-    : path.startsWith('/workspace/') 
-    ? path.split('/')[2] 
+  const isProjectsList = cleanPath === '/projects' || cleanPath === '/search-projects' || cleanPath === '/project-search' || cleanPath === '/freelance-jobs';
+  const isFreelancersPage = cleanPath === '/freelancers' || cleanPath === '/search-freelancers' || cleanPath === '/freelancer-search';
+  const isOrders = cleanPath === '/orders';
+  const isMessages = cleanPath.startsWith('/messages') || cleanPath.startsWith('/workstream') || cleanPath.startsWith('/workstreams') || cleanPath.startsWith('/workspace');
+  const messageOrderId = cleanPath.startsWith('/messages/') 
+    ? cleanPath.split('/')[2] 
+    : cleanPath.startsWith('/workstreams/') 
+    ? cleanPath.split('/')[2] 
+    : cleanPath.startsWith('/workstream/') 
+    ? cleanPath.split('/')[2] 
+    : cleanPath.startsWith('/workspace/') 
+    ? cleanPath.split('/')[2] 
     : null;
-  const isCreateGig = path === '/create-gig';
-  const isPostProject = path === '/post-project';
-  const isPayments = path.startsWith('/payments');
-  const isAdmin = path === '/admin';
-  const isSupport = path === '/support';
-  const isSettings = path === '/settings';
-  const isEditProfile = path === '/edit-profile' || path === '/freelancer/edit' || path === '/profile/edit' || (path.startsWith('/freelancer/') && path.endsWith('/edit')) || (path.startsWith('/profile/') && path.endsWith('/edit'));
-  const isLoginRoute = path === '/login';
-  const isSignupRoute = path === '/signup';
-  const isForgotPasswordRoute = path === '/forgot-password';
-  const isVerifyRoute = path === '/verify';
-  const isWishlistRoute = path === '/wishlist';
-  const isNotificationsRoute = path === '/notifications';
-  const isSwitchUserRoute = path === '/switch-user';
+  const isCreateGig = cleanPath === '/create-gig';
+  const isPostProject = cleanPath === '/post-project';
+  const isPayments = cleanPath.startsWith('/payments');
+  const isAdmin = cleanPath === '/admin';
+  const isSupport = cleanPath === '/support';
+  const isSettings = cleanPath === '/settings';
+  const isEditProfile = cleanPath === '/edit-profile' || cleanPath === '/freelancer/edit' || cleanPath === '/profile/edit' || (cleanPath.startsWith('/freelancer/') && cleanPath.endsWith('/edit')) || (cleanPath.startsWith('/profile/') && cleanPath.endsWith('/edit'));
+  const isLoginRoute = cleanPath === '/login';
+  const isSignupRoute = cleanPath === '/signup';
+  const isForgotPasswordRoute = cleanPath === '/forgot-password';
+  const isVerifyRoute = cleanPath === '/verify';
+  const isWishlistRoute = cleanPath === '/wishlist';
+  const isNotificationsRoute = cleanPath === '/notifications';
+  const isSwitchUserRoute = cleanPath === '/switch-user';
+  const isBuyerActivity = cleanPath === '/buyer-activity' || cleanPath === '/manage/projects' || cleanPath === '/buyer/activity';
 
   // Gig detail route check: Fiverr style /:username/:slug OR /gigs/:id
-  let currentGig: Gig | undefined = initialData?.gig;
-  let isGigDetail = Boolean(currentGig);
+  let currentGig: Gig | undefined;
+  let isGigDetail = false;
 
-  if (!currentGig) {
-    if (pathParts.length === 2 && !reservedRoutes.includes(pathParts[0].toLowerCase())) {
-      const usernameParam = pathParts[0].toLowerCase();
-      const slugParam = pathParts[1].toLowerCase();
+  if (pathParts.length === 2 && !reservedRoutes.includes(pathParts[0].toLowerCase())) {
+    const usernameParam = pathParts[0].toLowerCase();
+    const slugParam = pathParts[1].toLowerCase();
 
-      currentGig = gigs.find(g => {
-        const gigUsername = (g.freelancerUsername || slugify(g.freelancerName)).toLowerCase();
-        const gigSlug = (g.slug || slugify(g.title)).toLowerCase();
-        return gigUsername === usernameParam && gigSlug === slugParam;
-      });
+    currentGig = gigs.find(g => {
+      const gigUsername = (g.freelancerUsername || slugify(g.freelancerName)).toLowerCase();
+      const gigSlug = (g.slug || slugify(g.title)).toLowerCase();
+      const matchUser = gigUsername === usernameParam || slugify(g.freelancerName).toLowerCase() === usernameParam || (g.freelancerId && g.freelancerId.toLowerCase() === usernameParam);
+      const matchSlug = gigSlug === slugParam || g.id.toLowerCase() === slugParam;
+      return matchUser && matchSlug;
+    });
 
-      if (currentGig) {
-        isGigDetail = true;
-      }
-    } else if (path.startsWith('/gigs/') && path.length > 6) {
-      const gigIdParam = path.replace('/gigs/', '').toLowerCase();
-      currentGig = gigs.find(g => g.id.toLowerCase() === gigIdParam || (g.slug && g.slug.toLowerCase() === gigIdParam));
-      if (currentGig) {
-        isGigDetail = true;
-      }
+    if (!currentGig && initialData?.gig) {
+      const initG = initialData.gig;
+      const gigUsername = (initG.freelancerUsername || slugify(initG.freelancerName)).toLowerCase();
+      const gigSlug = (initG.slug || slugify(initG.title)).toLowerCase();
+      const matchUser = gigUsername === usernameParam || slugify(initG.freelancerName).toLowerCase() === usernameParam;
+      const matchSlug = gigSlug === slugParam || initG.id.toLowerCase() === slugParam;
+      if (matchUser && matchSlug) currentGig = initG;
+    }
+
+    if (currentGig) {
+      isGigDetail = true;
+    }
+  } else if (cleanPath.startsWith('/gigs/') && cleanPath.length > 6) {
+    const gigIdParam = cleanPath.replace('/gigs/', '').toLowerCase();
+    currentGig = gigs.find(g => g.id.toLowerCase() === gigIdParam || (g.slug && g.slug.toLowerCase() === gigIdParam));
+    if (!currentGig && initialData?.gig && (initialData.gig.id.toLowerCase() === gigIdParam || (initialData.gig.slug && initialData.gig.slug.toLowerCase() === gigIdParam))) {
+      currentGig = initialData.gig;
+    }
+    if (currentGig) {
+      isGigDetail = true;
     }
   }
 
   let isProfilePage = false;
-  let profileUserUsername = null;
+  let profileUserUsername: string | null = null;
   if (!isGigDetail) {
     if (pathParts.length === 1 && !reservedRoutes.includes(pathParts[0].toLowerCase())) {
       profileUserUsername = pathParts[0].toLowerCase();
       isProfilePage = true;
-    } else if (path.startsWith('/profile/') && pathParts.length >= 2) {
+    } else if ((cleanPath.startsWith('/profile/') || cleanPath.startsWith('/freelancers/')) && pathParts.length >= 2) {
       profileUserUsername = pathParts[1].toLowerCase();
       isProfilePage = true;
     }
   }
 
   const profileUser = isProfilePage 
-    ? (usersList.find(u => slugify(u.name) === profileUserUsername || u.id === profileUserUsername) || (impersonatedUser || currentUser || usersList[0]))
+    ? (usersList.find(u => {
+        if (!profileUserUsername) return false;
+        const target = profileUserUsername.toLowerCase();
+        return (u.username && u.username.toLowerCase() === target) ||
+               (u.name && slugify(u.name).toLowerCase() === target) ||
+               (u.name && u.name.toLowerCase() === target) ||
+               (u.id && u.id.toLowerCase() === target);
+      }) || (initialData?.profileUser) || (impersonatedUser || currentUser || usersList[0]))
     : null;
 
-  const isGigsList = (path === '/gigs' || path === '/' || isCategoryRoute) && !isGigDetail && !isProfilePage && !isEditProfile && !isSettings;
+  const isGigsList = (cleanPath === '/gigs' || cleanPath === '/' || isCategoryRoute) && !isGigDetail && !isProfilePage && !isEditProfile && !isSettings && !isProjectsList && !isFreelancersPage && !isOrders && !isMessages && !isCreateGig && !isPostProject && !isPayments && !isAdmin && !isSupport && !isBuyerActivity;
 
   // Sync pathname route
   useEffect(() => {
     const handlePopState = () => {
       const newPath = window.location.pathname || '/';
-      if ((newPath.startsWith('/messages') || newPath.startsWith('/workstreams')) && !getAuthToken()) {
-        window.history.replaceState({}, '', '/');
-        setPath('/');
-        setIsLoginModalOpen(true);
-        return;
-      }
       setPath(newPath);
     };
     window.addEventListener('popstate', handlePopState);
@@ -569,16 +591,40 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     }
   }, [messageOrderId, orders, path]);
 
-  const navigate = (to: string, e?: React.MouseEvent) => {
-    if ((to.startsWith('/messages') || to.startsWith('/workstreams')) && !currentUser) {
-      setIsLoginModalOpen(true);
-      return;
+  const navigate = (to: string, e?: React.MouseEvent | MouseEvent) => {
+    if (e && typeof e.preventDefault === 'function') e.preventDefault();
+    if (typeof window !== 'undefined') {
+      window.history.pushState({}, '', to);
+      setPath(to);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
-    if (e) e.preventDefault();
-    window.history.pushState({}, '', to);
-    setPath(to);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
   };
+
+  // Intercept all internal anchor clicks across the entire site
+  useEffect(() => {
+    const handleGlobalAnchorClick = (e: MouseEvent) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.defaultPrevented) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const anchor = target.closest('a');
+      if (!anchor) return;
+      if (anchor.target === '_blank' || anchor.hasAttribute('download')) return;
+      const href = anchor.getAttribute('href');
+      if (!href || href.startsWith('#') || href.startsWith('mailto:') || href.startsWith('tel:') || href.startsWith('javascript:')) return;
+
+      if (href.startsWith('/') && !href.startsWith('//')) {
+        e.preventDefault();
+        navigate(href, e);
+      } else if (typeof window !== 'undefined' && href.startsWith(window.location.origin + '/')) {
+        const localPath = href.slice(window.location.origin.length);
+        e.preventDefault();
+        navigate(localPath, e);
+      }
+    };
+
+    document.addEventListener('click', handleGlobalAnchorClick);
+    return () => document.removeEventListener('click', handleGlobalAnchorClick);
+  }, [currentUser]);
 
   const { 
     hydratedWorkstreamItems, 
@@ -616,17 +662,15 @@ export default function App({ initialPath, initialData }: { initialPath?: string
   // Fetch initial data & restore user session
   useEffect(() => {
     if (window.location.pathname === '/messages' && !getAuthToken()) {
-        setPath('/');
-        window.history.replaceState({}, '', '/');
-        setIsLoginModalOpen(true);
+      setPath('/');
+      window.history.replaceState({}, '', '/');
+      setIsLoginModalOpen(true);
     }
     const token = getAuthToken();
     if (token) {
-        loadUserSession().then(() => {
-          refresh();
-        });
-    } else {
-        refresh();
+      loadUserSession();
+    } else if (!initialData?.gigs?.length) {
+      refresh();
     }
   }, []);
 
@@ -674,17 +718,13 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     }
   };
 
-
-
-
-
+  const activeUserId = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : null);
   useEffect(() => {
-    const activeUserId = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : null);
     if (activeUserId) {
-        fetchUserEmails(activeUserId);
-        refresh();
+      fetchUserEmails(activeUserId);
+      refresh();
     }
-  }, [impersonatedUser, currentUser]);
+  }, [activeUserId]);
 
   const handleContactSeller = async (sellerId: string, sellerName: string, gigTitle: string, gigId?: string, projectId?: string) => {
     const currentUid = impersonatedUser ? impersonatedUser.id : currentUser?.id;
@@ -1535,6 +1575,18 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     setLoginEmail('');
     setLoginPassword('');
     setLoginError(null);
+    setOrders([]);
+    setMessages([]);
+    setSelectedOrder(null);
+    setSelectedPersonFilter(null);
+    setWorkstreamSearch('');
+    setProjectFilterSearch('');
+    setWorkstreamTab('all');
+    setLikedGigIds([]);
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
     navigate('/login');
   };
 
@@ -1647,7 +1699,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     e.preventDefault();
     if (!supportSubject.trim() || !supportMessage.trim()) return;
     try {
-      const activeUserId = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : 'user_1');
+      const activeUserId = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : '');
       const res = await fetch('/api/support-tickets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-user-id': activeUserId },
@@ -1749,7 +1801,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     ];
     const randomFile = mockFiles[Math.floor(Math.random() * mockFiles.length)];
     
-    const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : 'user_1');
+    const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : '');
     const currentUname = impersonatedUser ? impersonatedUser.name : (currentUser ? currentUser.name : 'Guest');
 
     const token = getAuthToken();
@@ -1776,7 +1828,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
     e.preventDefault();
     if (!newMessageText.trim() || !selectedOrder) return;
 
-    const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : 'user_1');
+    const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : '');
     const currentUname = impersonatedUser ? impersonatedUser.name : (currentUser ? currentUser.name : 'Guest');
 
     try {
@@ -1898,7 +1950,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
         return [
           {
             id: gigId,
-            freelancerId: profileUser?.id || 'user_1',
+            freelancerId: profileUser?.id || '',
             freelancerName: profileUser?.name || 'Freelancer',
             freelancerUsername: profileUser ? slugify(profileUser.name) : 'freelancer',
             freelancerAvatar: profileUser?.avatar || '',
@@ -2026,12 +2078,12 @@ export default function App({ initialPath, initialData }: { initialPath?: string
 
   // Project proposal & detail route check: /projects/:id OR /project/:slug OR /freelance-jobs/...
   const isProjectDetail = (
-    (path.startsWith('/projects/') && path.length > 10) ||
-    (path.startsWith('/project/') && path.length > 9) ||
-    (path.startsWith('/freelance-jobs/') && path.length > 16)
-  ) && !path.endsWith('/projects') && !path.endsWith('/freelance-jobs');
+    (cleanPath.startsWith('/projects/') && cleanPath.length > 10) ||
+    (cleanPath.startsWith('/project/') && cleanPath.length > 9) ||
+    (cleanPath.startsWith('/freelance-jobs/') && cleanPath.length > 16)
+  ) && !cleanPath.endsWith('/projects') && !cleanPath.endsWith('/freelance-jobs');
 
-  const projIdParam = isProjectDetail ? path.split('/').pop() : null;
+  const projIdParam = isProjectDetail ? cleanPath.split('/').pop() : null;
 
   const currentProject = isProjectDetail
     ? (projects.find(p => {
@@ -2045,7 +2097,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
                lower.endsWith(pId) || 
                lower.includes(pSlug) || 
                pSlug.includes(lower);
-      }) || projects[0])
+      }) || (initialData?.project) || projects[0])
     : undefined;
 
   // Filtered Gigs computation
@@ -2115,26 +2167,28 @@ export default function App({ initialPath, initialData }: { initialPath?: string
   // Dedicated Admin Panel Route
   if (isAdmin) {
     return (
-      <AdminPage
-        currentUser={currentUser}
-        impersonatedUser={impersonatedUser}
-        updateCurrentUser={updateCurrentUser}
-        setImpersonatedUser={setImpersonatedUser}
-        usersList={usersList}
-        setUsersList={setUsersList}
-        projects={projects}
-        gigs={gigs}
-        orders={orders}
-        proposals={proposals}
-        platformFee={platformFee}
-        clientServiceFee={clientServiceFee}
-        smallOrderFeeThreshold={smallOrderFeeThreshold}
-        smallOrderFeeAmount={smallOrderFeeAmount}
-        escrowProtectionDays={escrowProtectionDays}
-        navigate={navigate}
-        refresh={refresh}
-        getDeviceId={getDeviceId}
-      />
+      <Suspense fallback={<div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-500 text-sm font-semibold">Loading Admin Console...</div>}>
+        <AdminPage
+          currentUser={currentUser}
+          impersonatedUser={impersonatedUser}
+          updateCurrentUser={updateCurrentUser}
+          setImpersonatedUser={setImpersonatedUser}
+          usersList={usersList}
+          setUsersList={setUsersList}
+          projects={projects}
+          gigs={gigs}
+          orders={orders}
+          proposals={proposals}
+          platformFee={platformFee}
+          clientServiceFee={clientServiceFee}
+          smallOrderFeeThreshold={smallOrderFeeThreshold}
+          smallOrderFeeAmount={smallOrderFeeAmount}
+          escrowProtectionDays={escrowProtectionDays}
+          navigate={navigate}
+          refresh={refresh}
+          getDeviceId={getDeviceId}
+        />
+      </Suspense>
     );
   }
 
@@ -2145,7 +2199,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
       <Header
         navigate={navigate}
         currentUser={impersonatedUser || currentUser}
-        orders={hydratedWorkstreamItems}
+        orders={currentUser || impersonatedUser ? hydratedWorkstreamItems : []}
         likedGigIds={likedGigIds}
         isGigsList={isGigsList}
         isGigDetail={isGigDetail}
@@ -2158,6 +2212,9 @@ export default function App({ initialPath, initialData }: { initialPath?: string
         setSelectedOrder={setSelectedOrder}
         setPath={setPath}
         fetchMessages={fetchMessages}
+        onOpenLogin={() => setIsLoginModalOpen(true)}
+        onOpenSignup={() => setIsSignupModalOpen(true)}
+        onOpenSwitchUser={() => setIsUserSwitchModalOpen(true)}
       />
 
       {/* PeoplePerHour Category Navigation Bar */}
@@ -2228,9 +2285,9 @@ export default function App({ initialPath, initialData }: { initialPath?: string
                 {freelanceTab === 'projects' ? (
                   <div className="bg-white border border-slate-200 rounded-3xl shadow-xs divide-y divide-slate-100 overflow-hidden">
                     {(() => {
-                      const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : 'user_1');
+                      const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : '');
                       const filteredOrders = orders.filter(ord => {
-                        const isMyOrder = ord.sellerId === currentUid || ord.buyerId === currentUid || currentUid === 'user_1';
+                        const isMyOrder = Boolean(currentUid && (ord.sellerId === currentUid || ord.buyerId === currentUid));
                         if (!isMyOrder) return false;
 
                         const isExpired = (new Date(ord.dueDate) < new Date() && ord.status !== 'completed') || ord.status === 'cancelled';
@@ -2285,9 +2342,9 @@ export default function App({ initialPath, initialData }: { initialPath?: string
                 ) : (
                   <div className="bg-white border border-slate-200 rounded-3xl shadow-xs divide-y divide-slate-100 overflow-hidden">
                     {(() => {
-                      const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : 'user_1');
+                      const currentUid = impersonatedUser ? impersonatedUser.id : (currentUser ? currentUser.id : '');
                       const filteredGigs = gigs.filter(g => {
-                        const isMyGig = g.freelancerId === currentUid || (currentUser && g.freelancerName?.toLowerCase() === currentUser.name?.toLowerCase()) || currentUid === 'user_1';
+                        const isMyGig = Boolean(currentUid && (g.freelancerId === currentUid || (currentUser && g.freelancerName?.toLowerCase() === currentUser.name?.toLowerCase())));
                         if (!isMyGig) return false;
 
                         if (freelanceSubFilter === 'Active') return g.status === 'published' && (!g.moderationStatus || g.moderationStatus === 'approved');
@@ -2850,14 +2907,14 @@ export default function App({ initialPath, initialData }: { initialPath?: string
                   onClick={(e) => navigate('/projects', e)}
                   className="inline-flex items-center gap-2 px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl transition-all shadow-xs shrink-0 cursor-pointer"
                 >
-                  <span>View All Projects ({projects.length})</span>
+                  <span>View All Projects ({projects.filter(p => p.status === 'open' || p.status === 'published').length})</span>
                   <ChevronRight className="w-4 h-4 text-emerald-400" />
                 </button>
               </div>
 
               {/* Listicle View of Projects */}
               <div className="space-y-4">
-                {projects.slice(0, 8).map((project) => {
+                {projects.filter(p => p.status === 'open' || p.status === 'published').slice(0, 8).map((project) => {
                   const projectUrl = `/projects/${project.id}`;
                   return (
                     <div
@@ -3002,12 +3059,28 @@ export default function App({ initialPath, initialData }: { initialPath?: string
         {isProjectDetail && currentProject && (
           <ProjectDetailView
             project={currentProject}
-            currentUser={currentUser}
+            currentUser={impersonatedUser || currentUser}
             navigate={navigate}
             onSubmitProposal={(projectId, bidAmount, deliveryDays, coverLetter) => {
               handleSubmitProposalDirect(projectId, bidAmount, deliveryDays, coverLetter);
             }}
             allProjects={projects}
+            proposals={proposals}
+            orders={orders}
+            onRefresh={refresh}
+            onContactBuyer={(buyerId, buyerName, projectTitle, projectId) => {
+              handleContactSeller(buyerId, buyerName, projectTitle, undefined, projectId);
+            }}
+          />
+        )}
+
+        {isBuyerActivity && (
+          <BuyerActivityView
+            projects={projects}
+            orders={orders}
+            offers={offers}
+            currentUser={impersonatedUser || currentUser}
+            navigate={navigate}
           />
         )}
 
@@ -3072,11 +3145,13 @@ export default function App({ initialPath, initialData }: { initialPath?: string
 
         {/* VIEW: ACCOUNT & PROFILE SETTINGS WEBPAGE (/settings) */}
         {isSettings && (
-          <SettingsPage 
-            currentUser={currentUser}
-            updateCurrentUser={updateCurrentUser}
-            navigate={navigate}
-          />
+          <Suspense fallback={<div className="py-16 text-center text-slate-400 text-sm">Loading Settings...</div>}>
+            <SettingsPage 
+              currentUser={currentUser}
+              updateCurrentUser={updateCurrentUser}
+              navigate={navigate}
+            />
+          </Suspense>
         )}
 
         {/* VIEW: LOGIN WEBPAGE (/login) */}
@@ -4020,6 +4095,20 @@ export default function App({ initialPath, initialData }: { initialPath?: string
         
         {/* VIEW 6: WORKSTREAMS & MESSAGES (/messages) */}
         {isMessages && (
+          (!currentUser && !impersonatedUser) ? (
+            <div className="max-w-md mx-auto my-16 p-8 bg-white border border-slate-200 rounded-3xl text-center space-y-4 shadow-sm">
+              <Shield className="w-12 h-12 text-slate-400 mx-auto" />
+              <h2 className="text-xl font-bold text-fiverr-dark">Sign in to Access Your Workstreams</h2>
+              <p className="text-xs text-fiverr-muted">Track project milestones, real-time workstream messages, and escrow releases.</p>
+              <button 
+                onClick={() => setIsLoginModalOpen(true)} 
+                className="w-full py-2.5 bg-slate-900 text-white font-semibold rounded-xl hover:bg-slate-800 transition cursor-pointer"
+              >
+                Sign In to WorkPerHour
+              </button>
+            </div>
+          ) : (
+          <Suspense fallback={<div className="py-16 text-center text-slate-400 text-sm">Loading Workstreams...</div>}>
           <div className="bg-slate-50 min-h-[750px] font-sans pb-12">
             {selectedOrder || messageOrderId ? (
               // Active Workstream Workspace View
@@ -4173,6 +4262,8 @@ export default function App({ initialPath, initialData }: { initialPath?: string
               currentUser={impersonatedUser || currentUser}
             />
           </div>
+          </Suspense>
+          )
         )}
 
         {/* VIEW 7: CREATE GIG STUDIO (/create-gig) */}
@@ -4313,6 +4404,7 @@ export default function App({ initialPath, initialData }: { initialPath?: string
         currentUser={currentUser || usersList[0]}
         setCurrentUser={updateCurrentUser}
         setImpersonatedUser={setImpersonatedUser}
+        refresh={refresh}
       />
 
       {/* PROFILE PAGE VIEW (Matches PeoplePerHour design from screenshot exactly) */}
@@ -4331,23 +4423,27 @@ export default function App({ initialPath, initialData }: { initialPath?: string
 
       {/* EDIT PROFILE WEBPAGE (/edit-profile or /freelancer/edit) */}
       {isEditProfile && (
-        <EditProfilePage 
-          currentUser={currentUser}
-          updateCurrentUser={updateCurrentUser}
-          navigate={navigate}
-        />
+        <Suspense fallback={<div className="py-16 text-center text-slate-400 text-sm">Loading Profile Editor...</div>}>
+          <EditProfilePage 
+            currentUser={currentUser}
+            updateCurrentUser={updateCurrentUser}
+            navigate={navigate}
+          />
+        </Suspense>
       )}
       {isPayments && (
         (impersonatedUser || currentUser) ? (
           <div className="max-w-7xl mx-auto px-4 py-8">
-            <PaymentsModule 
-              gigs={gigs} 
-              orders={orders} 
-              projects={projects} 
-              proposals={proposals} 
-              currentUser={(impersonatedUser || currentUser)!} 
-              onBalanceUpdate={refresh}
-            />
+            <Suspense fallback={<div className="py-16 text-center text-slate-400 text-sm">Loading Payments & Wallet...</div>}>
+              <PaymentsModule 
+                gigs={gigs} 
+                orders={orders} 
+                projects={projects} 
+                proposals={proposals} 
+                currentUser={(impersonatedUser || currentUser)!} 
+                onBalanceUpdate={refresh}
+              />
+            </Suspense>
           </div>
         ) : (
           <div className="max-w-md mx-auto my-16 p-8 bg-white border border-slate-200 rounded-3xl text-center space-y-4 shadow-sm">
@@ -4388,6 +4484,11 @@ export default function App({ initialPath, initialData }: { initialPath?: string
         setMockEmailCodeDisplay={setMockEmailCodeDisplay}
         loginError={loginError}
         isSubmittingLogin={isSubmittingLogin}
+        onSwitchToSignup={() => {
+          setIsLoginModalOpen(false);
+          setSignupEmail(loginEmail);
+          setIsSignupModalOpen(true);
+        }}
       />
 
       <SignupModal

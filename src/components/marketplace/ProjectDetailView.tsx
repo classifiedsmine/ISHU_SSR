@@ -26,8 +26,9 @@ import {
   Zap,
   HelpCircle
 } from 'lucide-react';
-import { Project, User as UserType, Proposal } from '../../types';
+import { Project, User as UserType, Proposal, Order } from '../../types';
 import { calculateOrderFees } from '../../shared/fees';
+import { getAuthToken } from '../../utils/authToken';
 
 interface ProjectDetailViewProps {
   project: Project;
@@ -37,6 +38,10 @@ interface ProjectDetailViewProps {
   onBookmarkProject?: (projectId: string) => void;
   isBookmarked?: boolean;
   allProjects?: Project[];
+  proposals?: Proposal[];
+  orders?: Order[];
+  onRefresh?: () => Promise<void> | void;
+  onContactBuyer?: (buyerId: string, buyerName: string, projectTitle: string, projectId: string) => void;
 }
 
 export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
@@ -46,7 +51,11 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   onSubmitProposal,
   onBookmarkProject,
   isBookmarked = false,
-  allProjects = []
+  allProjects = [],
+  proposals = [],
+  orders = [],
+  onRefresh,
+  onContactBuyer
 }) => {
   // Local state for proposal submission
   const [proposalBid, setProposalBid] = useState<number | string>(project.budgetMax || project.budgetMin || 1000);
@@ -56,6 +65,104 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
   const [isGeneratingAI, setIsGeneratingAI] = useState<boolean>(false);
   const [isSubmitted, setIsSubmitted] = useState<boolean>(false);
   const [submittedProposal, setSubmittedProposal] = useState<Proposal | null>(null);
+  const [busyProposalId, setBusyProposalId] = useState<string | null>(null);
+  const [proposalActionError, setProposalActionError] = useState<string | null>(null);
+  const [proposalActionSuccess, setProposalActionSuccess] = useState<{ message: string; workstreamOrderId?: string } | null>(null);
+  const [localProjectStatus, setLocalProjectStatus] = useState<Project['status']>(project.status);
+  const [isUpdatingProjectStatus, setIsUpdatingProjectStatus] = useState<boolean>(false);
+
+  useEffect(() => {
+    setLocalProjectStatus(project.status);
+  }, [project.id, project.status]);
+
+  const effectiveStatus = localProjectStatus || project.status;
+  const isProjectCompleted = effectiveStatus === 'completed';
+
+  const isProjectOwner = Boolean(currentUser && currentUser.id === project.buyerId);
+  const projectProposals = proposals.filter(p => p.projectId === project.id);
+  const myProposalsOnProject = currentUser ? projectProposals.filter(p => p.freelancerId === currentUser.id) : [];
+
+  const handleUpdateProjectStatus = async (nextStatus: 'completed' | 'open') => {
+    if (isUpdatingProjectStatus) return;
+    setIsUpdatingProjectStatus(true);
+    setProposalActionError(null);
+    setProposalActionSuccess(null);
+    try {
+      const token = getAuthToken();
+      const res = await fetch(`/api/projects/${project.id}/status`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ status: nextStatus })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setProposalActionError(data.error || 'Failed to update project status.');
+        return;
+      }
+      setLocalProjectStatus(nextStatus);
+      if (onRefresh) await onRefresh();
+      if (nextStatus === 'completed') {
+        setProposalActionSuccess({
+          message: 'Project marked as completed (Bidding Closed). Your project is now hidden from the public project listing page.'
+        });
+      } else {
+        setProposalActionSuccess({
+          message: 'Project reopened for bidding and restored to the public project listing page.'
+        });
+      }
+    } catch (err: any) {
+      setProposalActionError(err?.message || 'Failed to update project status.');
+    } finally {
+      setIsUpdatingProjectStatus(false);
+    }
+  };
+
+  const resolveProposalWorkstreamId = (prop: Proposal): string | undefined => {
+    if (prop.workstreamOrderId) return prop.workstreamOrderId;
+    return orders.find(o => o.proposalId && o.proposalId === prop.id)?.id;
+  };
+
+  const handleProposalDecision = async (prop: Proposal, action: 'accept' | 'decline') => {
+    if (busyProposalId) return;
+
+    setBusyProposalId(prop.id);
+    setProposalActionError(null);
+    setProposalActionSuccess(null);
+    try {
+      const token = getAuthToken();
+      const res = await fetch(`/api/proposals/${prop.id}/${action}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        }
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setProposalActionError(data.error || `Failed to ${action} proposal.`);
+        setBusyProposalId(null);
+        return;
+      }
+      if (onRefresh) await onRefresh();
+      if (action === 'accept') {
+        setProposalActionSuccess({
+          message: `Hired ${prop.freelancerName} ($${prop.bidAmount.toLocaleString()} USD funded in escrow). Their independent Workstream is now active!`,
+          workstreamOrderId: data.workstreamOrderId || data.order?.id
+        });
+      } else {
+        setProposalActionSuccess({
+          message: `Declined proposal from ${prop.freelancerName}.`
+        });
+      }
+    } catch (err: any) {
+      setProposalActionError(err?.message || `Failed to ${action} proposal.`);
+    } finally {
+      setBusyProposalId(null);
+    }
+  };
 
   // Bookmark & Share state
   const [bookmarked, setBookmarked] = useState<boolean>(isBookmarked);
@@ -191,9 +298,9 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
     }, 1200);
   };
 
-  // Similar projects filter
+  // Similar projects filter (only open/published projects)
   const relatedProjects = allProjects
-    .filter(p => p.id !== project.id && (p.category === project.category || p.skills?.some(s => project.skills?.includes(s))))
+    .filter(p => p.id !== project.id && (p.status === 'open' || p.status === 'published') && (p.category === project.category || p.skills?.some(s => project.skills?.includes(s))))
     .slice(0, 3);
 
   return (
@@ -235,7 +342,16 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                 }`}>
                   {project.projectType === 'hourly' ? 'Hourly Rate' : 'Fixed Price'}
                 </span>
-                {project.isUrgent && (
+                {isProjectCompleted ? (
+                  <span className="px-2.5 py-0.5 text-xs font-bold rounded-md bg-slate-900 text-white border border-slate-800 flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-400" /> Completed · Bidding Closed
+                  </span>
+                ) : (
+                  <span className="px-2.5 py-0.5 text-xs font-bold rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    Open for Proposals
+                  </span>
+                )}
+                {project.isUrgent && !isProjectCompleted && (
                   <span className="px-2.5 py-0.5 text-xs font-bold rounded-md bg-amber-100 text-amber-800 border border-amber-200 flex items-center gap-1">
                     <Zap className="w-3 h-3 fill-amber-500 text-amber-500" /> Urgent Job
                   </span>
@@ -263,7 +379,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                 <span className="hidden sm:inline text-slate-300">•</span>
                 <span className="flex items-center gap-1.5">
                   <Briefcase className="w-3.5 h-3.5 text-slate-400" />
-                  <span>{project.proposalsCount || 8} Proposals received</span>
+                  <span>{project.proposalsCount || 0} Proposals received</span>
                 </span>
                 <span className="hidden sm:inline text-slate-300">•</span>
                 <span className="flex items-center gap-1.5">
@@ -273,8 +389,8 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
               </div>
             </div>
 
-            {/* Quick Action Top Bar (Bookmark & Share) */}
-            <div className="flex items-center gap-2 shrink-0 pt-2 lg:pt-0">
+            {/* Quick Action Top Bar (Bookmark, Share & Owner/Freelancer CTA) */}
+            <div className="flex flex-wrap items-center gap-2 shrink-0 pt-2 lg:pt-0">
               <button
                 type="button"
                 onClick={handleToggleBookmark}
@@ -298,12 +414,19 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                 <span className="hidden sm:inline">{copiedLink ? 'Link Copied!' : 'Share'}</span>
               </button>
 
-              <a
-                href="#submit-proposal-section"
-                className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs rounded-xl shadow-xs transition-all flex items-center gap-1.5"
-              >
-                <span>Send Proposal</span>
-              </a>
+              {isProjectOwner ? null : isProjectCompleted ? (
+                <span className="px-4 py-2.5 bg-slate-100 text-slate-600 border border-slate-200 font-bold text-xs rounded-xl flex items-center gap-1.5">
+                  <CheckCircle2 className="w-4 h-4 text-slate-500" />
+                  <span>Bidding Closed</span>
+                </span>
+              ) : (
+                <a
+                  href="#submit-proposal-section"
+                  className="px-5 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs rounded-xl shadow-xs transition-all flex items-center gap-1.5"
+                >
+                  <span>Send Proposal</span>
+                </a>
+              )}
             </div>
           </div>
 
@@ -520,13 +643,250 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
             </div>
 
 
-            {/* 3. PROPOSAL SUBMISSION SECTION */}
+            {/* 3. BUYER MULTI-PROPOSAL & MULTI-FREELANCER WORKSTREAMS PANEL */}
+            {isProjectOwner && (
+              <div id="buyer-proposals-section" className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 shadow-xs space-y-6">
+                <div className="pb-5 border-b border-slate-100 flex flex-col gap-4">
+                  <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
+                    <div className="space-y-1 max-w-2xl">
+                      <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
+                        Freelancer Proposals & Independent Workstreams ({projectProposals.length})
+                      </h2>
+                      <p className="text-xs text-slate-500 leading-relaxed">
+                        You can accept multiple proposals to hire multiple freelancers for this project. Every accepted freelancer receives their own independent USD escrow Workstream.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <span className="px-3 py-1 bg-emerald-50 text-emerald-800 border border-emerald-200 rounded-full text-xs font-bold">
+                        {projectProposals.filter(p => p.status === 'accepted').length} Hired
+                      </span>
+                      <span className="px-3 py-1 bg-amber-50 text-amber-800 border border-amber-200 rounded-full text-xs font-bold">
+                        {projectProposals.filter(p => p.status === 'pending').length} Pending
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="pt-1">
+                    <div className="text-xs text-slate-500 font-medium">
+                      Manage hiring decisions, review candidate proposals, and track escrow Workstreams below.
+                    </div>
+                  </div>
+                </div>
+
+                {isProjectCompleted && (
+                  <div className="p-4 bg-slate-900 text-white rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="flex items-center gap-2.5">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <div>
+                        <span className="font-bold block">Project Completed · Bidding Closed</span>
+                        <span className="text-slate-300 text-[11px]">
+                          This project is hidden from the public project listing page and closed to new proposals. Your active Workstreams continue normally.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {proposalActionError && (
+                  <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl text-xs text-rose-800 font-medium flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+                    <div className="flex items-start gap-2.5">
+                      <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                      <span className="leading-relaxed">{proposalActionError}</span>
+                    </div>
+                    {proposalActionError.toLowerCase().includes('wallet') && (
+                      <button
+                        type="button"
+                        onClick={() => navigate('/wallet')}
+                        className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold transition shrink-0 cursor-pointer shadow-xs flex items-center gap-1.5"
+                      >
+                        <span>Add Funds to Wallet</span>
+                        <span>→</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {proposalActionSuccess && (
+                  <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 font-bold">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      <span>{proposalActionSuccess.message}</span>
+                    </div>
+                    {proposalActionSuccess.workstreamOrderId && (
+                      <button
+                        type="button"
+                        onClick={(e) => navigate(`/messages/${proposalActionSuccess.workstreamOrderId}`, e)}
+                        className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl text-xs shrink-0 cursor-pointer"
+                      >
+                        Open Workstream →
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {projectProposals.length === 0 ? (
+                  <div className="p-8 text-center bg-slate-50 rounded-2xl border border-slate-100 text-xs text-slate-500">
+                    No proposals have been submitted for this project yet.
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {projectProposals.map((prop) => {
+                      const wsOrderId = resolveProposalWorkstreamId(prop);
+                      const wsOrder = wsOrderId ? orders.find(o => o.id === wsOrderId) : undefined;
+                      const isBusy = busyProposalId === prop.id;
+                      return (
+                        <div
+                          key={prop.id}
+                          className={`p-5 rounded-2xl border transition-all space-y-4 ${
+                            prop.status === 'accepted'
+                              ? 'bg-emerald-50/40 border-emerald-200'
+                              : prop.status === 'rejected'
+                                ? 'bg-slate-50 border-slate-200 opacity-75'
+                                : 'bg-white border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={prop.freelancerAvatar || 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&q=80&w=150'}
+                                alt={prop.freelancerName}
+                                className="w-11 h-11 rounded-full object-cover border border-slate-200 shrink-0"
+                              />
+                              <div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className="text-sm font-bold text-slate-900">{prop.freelancerName}</span>
+                                  <span className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase border ${
+                                    prop.status === 'accepted'
+                                      ? 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                                      : prop.status === 'rejected'
+                                        ? 'bg-rose-50 text-rose-700 border-rose-200'
+                                        : 'bg-amber-50 text-amber-800 border-amber-200'
+                                  }`}>
+                                    {prop.status === 'accepted' ? 'Accepted · Hired' : prop.status}
+                                  </span>
+                                  {wsOrderId && (
+                                    <span className="text-[11px] font-mono text-slate-500">
+                                      Workstream #{wsOrderId} {wsOrder ? `(${wsOrder.status.replace(/_/g, ' ')})` : ''}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs text-slate-500">{prop.freelancerTitle || 'Freelance Specialist'} • Submitted {prop.createdAt}</p>
+                              </div>
+                            </div>
+
+                            <div className="text-left sm:text-right shrink-0">
+                              <div className="text-xl font-black text-slate-900 font-mono">
+                                ${Number(prop.bidAmount).toLocaleString()} <span className="text-xs font-bold text-slate-500">USD</span>
+                              </div>
+                              <div className="text-xs text-slate-500">
+                                Delivery in <strong>{prop.deliveryDays}</strong> day{prop.deliveryDays === 1 ? '' : 's'}
+                              </div>
+                            </div>
+                          </div>
+
+                          <p className="text-xs text-slate-700 leading-relaxed whitespace-pre-line bg-white/80 p-3.5 rounded-xl border border-slate-100">
+                            {prop.coverLetter}
+                          </p>
+
+                          <div className="flex flex-wrap items-center justify-end gap-2.5 pt-1">
+                            {wsOrderId && (
+                              <button
+                                type="button"
+                                onClick={(e) => navigate(`/messages/${wsOrderId}`, e)}
+                                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 transition cursor-pointer"
+                              >
+                                <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>{prop.status === 'accepted' ? 'Open Independent Workstream' : 'Message in Workstream'}</span>
+                              </button>
+                            )}
+                            {prop.status === 'pending' && (
+                              <>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => handleProposalDecision(prop, 'accept')}
+                                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 transition cursor-pointer shadow-xs"
+                                >
+                                  <ShieldCheck className="w-3.5 h-3.5" />
+                                  <span>{isBusy ? 'Processing...' : `Accept & Hire ($${Number(prop.bidAmount).toLocaleString()} USD)`}</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => handleProposalDecision(prop, 'decline')}
+                                  className="px-3.5 py-2 border border-slate-200 hover:bg-slate-100 disabled:opacity-50 text-slate-600 font-bold rounded-xl text-xs transition cursor-pointer"
+                                >
+                                  Decline
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* FREELANCER'S EXISTING PROPOSALS ON THIS PROJECT */}
+            {!isProjectOwner && myProposalsOnProject.length > 0 && (
+              <div className="bg-white border border-emerald-200 rounded-2xl p-6 shadow-xs space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-base font-extrabold text-slate-900 flex items-center gap-2">
+                    <CheckCircle2 className="w-5 h-5 text-emerald-600" />
+                    <span>Your Submitted Proposal{myProposalsOnProject.length > 1 ? 's' : ''} ({myProposalsOnProject.length})</span>
+                  </h3>
+                </div>
+                <div className="space-y-3">
+                  {myProposalsOnProject.map(myProp => {
+                    const wsId = resolveProposalWorkstreamId(myProp);
+                    return (
+                      <div key={myProp.id} className="p-4 bg-emerald-50/50 border border-emerald-200/80 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-black text-slate-900 font-mono">${Number(myProp.bidAmount).toLocaleString()} USD</span>
+                            <span className="text-xs text-slate-500">• {myProp.deliveryDays} days delivery</span>
+                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                              myProp.status === 'accepted' ? 'bg-emerald-600 text-white' :
+                              myProp.status === 'rejected' ? 'bg-rose-100 text-rose-800' : 'bg-amber-100 text-amber-800'
+                            }`}>
+                              {myProp.status}
+                            </span>
+                          </div>
+                          <p className="text-xs text-slate-600 line-clamp-2">{myProp.coverLetter}</p>
+                        </div>
+                        {wsId && (
+                          <button
+                            type="button"
+                            onClick={(e) => navigate(`/messages/${wsId}`, e)}
+                            className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl text-xs shrink-0 cursor-pointer flex items-center gap-1.5"
+                          >
+                            <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>Open Workstream</span>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 4. PROPOSAL SUBMISSION SECTION */}
+            {!isProjectOwner && (
             <div id="submit-proposal-section" className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 shadow-xs space-y-6">
               
               <div className="pb-4 border-b border-slate-100 flex items-center justify-between">
                 <div>
-                  <h2 className="text-xl font-extrabold text-slate-900">Send Your Proposal</h2>
-                  <p className="text-xs text-slate-500">Submit your pitch, delivery timeframe, and deposit requirements directly to the buyer.</p>
+                  <h2 className="text-xl font-extrabold text-slate-900">
+                    {isProjectCompleted ? 'Project Completed — Bidding Closed' : 'Send Your Proposal'}
+                  </h2>
+                  <p className="text-xs text-slate-500">
+                    {isProjectCompleted
+                      ? 'The buyer has finished hiring for this project and closed bidding.'
+                      : 'Submit your pitch, delivery timeframe, and deposit requirements directly to the buyer.'}
+                  </p>
                 </div>
                 {isSubmitted && (
                   <span className="px-3 py-1 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded-full text-xs font-bold flex items-center gap-1">
@@ -535,7 +895,24 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                 )}
               </div>
 
-              {isSubmitted ? (
+              {isProjectCompleted ? (
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-6 text-center space-y-3">
+                  <CheckCircle2 className="w-10 h-10 text-slate-400 mx-auto" />
+                  <h3 className="text-base font-extrabold text-slate-900">This Project Listing is Closed</h3>
+                  <p className="text-xs text-slate-500 max-w-md mx-auto">
+                    {project.buyerName} has marked this project as completed and is no longer accepting new proposals.
+                  </p>
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      onClick={(e) => navigate('/projects', e)}
+                      className="px-5 py-2.5 bg-slate-900 text-white rounded-xl text-xs font-bold hover:bg-slate-800 transition-colors cursor-pointer"
+                    >
+                      Browse Open Projects
+                    </button>
+                  </div>
+                </div>
+              ) : isSubmitted ? (
                 <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 text-center space-y-4">
                   <div className="w-12 h-12 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center mx-auto shadow-sm">
                     <Check className="w-6 h-6 stroke-[3]" />
@@ -694,6 +1071,7 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
               )}
 
             </div>
+            )}
 
           </div>
 
@@ -781,14 +1159,22 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
               </div>
 
               {/* Contact Buyer Button */}
-              <button
-                type="button"
-                onClick={() => setIsContactModalOpen(true)}
-                className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-900 font-bold text-xs rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer border border-slate-200"
-              >
-                <MessageSquare className="w-4 h-4 text-slate-600" />
-                <span>Contact Buyer</span>
-              </button>
+              {!isProjectOwner && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (onContactBuyer) {
+                      onContactBuyer(project.buyerId, project.buyerName, project.title, project.id);
+                    } else {
+                      setIsContactModalOpen(true);
+                    }
+                  }}
+                  className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-900 font-bold text-xs rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer border border-slate-200"
+                >
+                  <MessageSquare className="w-4 h-4 text-slate-600" />
+                  <span>Contact Buyer</span>
+                </button>
+              )}
 
             </div>
 
@@ -806,13 +1192,15 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
                 </div>
 
                 <div className="flex justify-between items-center pb-2 border-b border-slate-50">
-                  <span className="text-slate-500">Time Remaining:</span>
-                  <span className="font-bold text-amber-600">6 days remaining</span>
+                  <span className="text-slate-500">Listing Status:</span>
+                  <span className={`font-bold ${isProjectCompleted ? 'text-slate-700' : 'text-emerald-600'}`}>
+                    {isProjectCompleted ? 'Completed (Closed)' : 'Open for Bidding'}
+                  </span>
                 </div>
 
                 <div className="flex justify-between items-center pb-2 border-b border-slate-50">
                   <span className="text-slate-500">Proposals Count:</span>
-                  <span className="font-bold text-slate-900">{project.proposalsCount || 8} Submitted</span>
+                  <span className="font-bold text-slate-900">{project.proposalsCount || 0} Submitted</span>
                 </div>
 
                 <div className="flex justify-between items-center">
@@ -822,12 +1210,36 @@ export const ProjectDetailView: React.FC<ProjectDetailViewProps> = ({
               </div>
 
               <div className="pt-2">
-                <a
-                  href="#submit-proposal-section"
-                  className="w-full py-3 bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-1.5"
-                >
-                  <span>Submit Proposal</span>
-                </a>
+                {isProjectOwner ? (
+                  isProjectCompleted ? (
+                    <button
+                      type="button"
+                      disabled={isUpdatingProjectStatus}
+                      onClick={() => handleUpdateProjectStatus('open')}
+                      className="w-full py-3 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 border border-slate-300 font-bold text-xs rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                      <span>{isUpdatingProjectStatus ? 'Updating...' : 'Reopen Project Bidding'}</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={isUpdatingProjectStatus}
+                      onClick={() => handleUpdateProjectStatus('completed')}
+                      className="w-full py-3 bg-slate-900 hover:bg-emerald-600 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                      <span>{isUpdatingProjectStatus ? 'Closing...' : 'Mark Project as Completed (Close Bidding)'}</span>
+                    </button>
+                  )
+                ) : !isProjectCompleted ? (
+                  <a
+                    href="#submit-proposal-section"
+                    className="w-full py-3 bg-emerald-500 hover:bg-emerald-600 text-slate-950 font-bold text-xs rounded-xl shadow-xs transition-all flex items-center justify-center gap-1.5"
+                  >
+                    <span>Submit Proposal</span>
+                  </a>
+                ) : null}
               </div>
             </div>
 

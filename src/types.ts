@@ -109,6 +109,8 @@ export interface Proposal {
   deliveryDays: number;
   createdAt: string;
   status: 'pending' | 'accepted' | 'rejected';
+  workstreamOrderId?: string;
+  offerId?: string;
 }
 
 export interface DeliveryRecord {
@@ -120,26 +122,56 @@ export interface DeliveryRecord {
   deliveredAt: string;
 }
 
+export interface Workspace {
+  workspaceId: string;
+  buyerId: string;
+  sellerId: string;
+  originType: 'gig' | 'project';
+  originId: string;
+  createdAt: string;
+  status: 'active' | 'archived';
+  activeOrderId?: string;
+}
+
+export interface GigOrder extends Order {
+  gigOrderId: string;
+  workspaceId: string;
+  gigId: string;
+}
+
+export interface ProjectOrder extends Order {
+  projectOrderId: string;
+  workspaceId: string;
+  projectId: string;
+  proposalId?: string;
+}
+
 export interface Order {
   id: string;
+  workspaceId?: string;
+  orderType?: 'gig' | 'project';
+  gigOrderId?: string;
+  projectOrderId?: string;
   title: string;
   buyerId: string;
   sellerId: string;
   amount: number;
-  status: 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
+  status: 'payment_pending' | 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
+  previousStatus?: string;
   createdAt: string;
   completedAt?: string;
   dueDate: string;
   requirements?: string;
   deliverables?: string;
   deliverableFiles?: Array<{ id?: string; name: string; url: string; size: string; uploadedAt?: string }>;
-  revisions?: Array<{ id: string; requestedAt: string; reason: string; status: string; version?: number; deliveryVersion?: number }>;
+  revisions?: Array<{ id?: string; requestedAt: string; reason: string; status: string; version?: number; deliveryVersion?: number }>;
   adminNotes?: string;
   isMuted?: boolean;
   escrowProtectionStartDate?: string;
   escrowProtectionEndDate?: string;
   gigId?: string;
   projectId?: string;
+  proposalId?: string;
   serviceUrl?: string;
   gigSlug?: string;
   sellerUsername?: string;
@@ -155,6 +187,11 @@ export interface Order {
   reviewWindowDays?: number;
   reviewWindowExpiresAt?: string;
   review?: Review;
+  sellerReview?: Review;
+  escrowRemaining?: number;
+  totalReleased?: number;
+  hasPaidInvoice?: boolean;
+  type?: 'gig' | 'project';
 }
 
 export interface UserAccount {
@@ -173,7 +210,7 @@ export interface UserAccount {
   completedJobs: number;
   bio: string;
   skills: string[];
-  status: 'active' | 'suspended' | 'restricted';
+  status: 'active' | 'suspended' | 'restricted' | 'deactivated';
   verified: boolean;
   emailVerified?: boolean;
   mobileVerified?: boolean;
@@ -194,6 +231,8 @@ export interface UserAccount {
   password?: string;
   membershipTier?: string;
   buyerMembershipTier?: string;
+  kycStatus?: string;
+  ActiveRole?: string;
 }
 
 export type User = UserAccount;
@@ -201,12 +240,16 @@ export type User = UserAccount;
 export interface Dispute {
   id: string;
   orderId: string;
+  buyerId?: string;
+  sellerId?: string;
   raisedBy: string;
   reason: string;
-  evidence: string;
+  evidence?: string;
   status: 'open' | 'under_investigation' | 'resolved_refund' | 'resolved_release' | 'resolved_partial';
   createdAt: string;
   resolutionNotes?: string;
+  resolutionType?: string;
+  notes?: string;
   assignedTo?: string;
 }
 
@@ -330,6 +373,15 @@ export interface Message {
     reviewWindowDays?: number;
     offerId?: string;
     offerKind?: string;
+    oldDate?: string;
+    newDueDate?: string;
+    files?: any;
+    reviewerRole?: string;
+    disputeId?: string;
+    raisedBy?: string;
+    isCancelledOrder?: boolean;
+    reply?: any;
+    status?: string;
   };
   status?: 'sending' | 'sent' | 'failed';
 }
@@ -340,20 +392,111 @@ export interface UserEmail {
   userEmail: string;
   subject: string;
   body: string;
-  type: 'SUSPEND' | 'RESTRICT' | 'IMPERSONATE' | 'GENERAL';
-  sentAt: string;
+  snippet?: string;
+  date?: string;
+  type: 'SUSPEND' | 'RESTRICT' | 'IMPERSONATE' | 'GENERAL' | string;
+  sentAt?: string;
   read: boolean;
+}
+
+
+
+export type WorkstreamOfferKind = 'proposal' | 'invoice' | 'deposit';
+export type WorkstreamOfferStatus = 'pending' | 'accepted' | 'paid' | 'declined' | 'cancelled';
+
+export interface WorkstreamOffer {
+  id: string;
+  number: string;
+  orderId: string;
+  workspaceId?: string;
+  proposalId?: string;
+  kind: WorkstreamOfferKind;
+  title: string;
+  amount: number;
+  deliveryDays?: number;
+  note?: string;
+  files?: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
+  reference?: string;
+  status: WorkstreamOfferStatus;
+  createdBy: string;
+  createdAt: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
+  metadata?: any;
+}
+
+export interface CustomInvoice {
+  id: string;
+  invoiceNumber: string;
+  invoice_number?: string;
+  userId?: string;
+  buyerId?: string;
+  sellerId?: string;
+  recipientName?: string;
+  recipientEmail?: string;
+  title?: string;
+  issueDate?: string;
+  dueDate?: string;
+  status: 'paid' | 'in_escrow' | 'unpaid' | 'refunded';
+  items?: Array<{ description: string; quantity: number; unitPrice: number; amount: number }>;
+  subtotal?: number;
+  platformFee?: number;
+  tax?: number;
+  total?: number;
+  amount?: number;
+  description?: string;
+  notes?: string;
+  relatedOrderId?: string;
+  createdAt?: string;
+  paidAt?: string;
+}
+export interface WorkstreamUploadRecord {
+  ownerId: string;
+  originalName?: string;
+  mime?: string;
+  size?: number;
+  createdAt: string;
+  sha256?: string;
 }
 
 export interface AppNotification {
   id: string;
   userId: string;
-  type: 'general' | 'missed_call';
+  type: string;
   title: string;
   message: string;
   targetWorkstreamId?: string;
   senderUsername?: string;
   projectTitle?: string;
+  link?: string;
   read: boolean;
   createdAt: string;
+  dedupKey?: string;
+}
+
+export type Notification = AppNotification;
+
+export interface SiteFeeSettings {
+  platformName: string;
+  supportEmail: string;
+  currency: string;
+  currencySymbol: string;
+  freelancerCommissionRate: number;
+  buyerProcessingFeeRate: number;
+  smallOrderFee: number;
+  smallOrderFeeThreshold: number;
+  minOrderAmount: number;
+  featuredGigFee: number;
+  urgentProjectFee: number;
+  escrowHoldDays: number;
+  autoCompleteDeliveredDays: number;
+  autoCompleteDeliveredEnabled?: boolean;
+  disputeWindowDays: number;
+  minPayoutThreshold: number;
+  instantPayoutFeeRate: number;
+  freelancerOnboardingMode: 'open' | 'moderated';
+  maintenanceMode: boolean;
+  maintenanceMessage?: string;
+  updatedAt?: string;
+  updatedBy?: string;
 }

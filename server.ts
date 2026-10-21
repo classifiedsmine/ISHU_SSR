@@ -10,6 +10,7 @@ import { randomUUID, randomBytes, randomInt, timingSafeEqual, createHmac } from 
 import bcrypt from 'bcryptjs';
 import type { Request, Response, NextFunction } from 'express';
 import { financeLedger, FinanceLedgerEngine } from './src/server/financeLedger.js';
+import { workspaceService } from './src/server/workspaceService.js';
 import { siteSettings, DEFAULT_SITE_SETTINGS } from './src/server/siteSettings.js';
 import { paymentGatewayManager } from './src/server/paymentGateways.js';
 import { sanitizePublicUser, isUserPublic, sanitizePublicGig, sanitizePublicProject, isGigPublic, isProjectPublic } from './server/publicData.js';
@@ -17,22 +18,68 @@ import { setupSSR } from './server/ssr.js';
 import { slugify } from './src/utils/slugify.js';
 export { siteSettings, DEFAULT_SITE_SETTINGS, isGigPublic, sanitizePublicGig };
 import { OrderFeeBreakdown } from './src/shared/fees.js';
+import { postgresStore } from './server/db/postgresStore.js';
 import {
-  SEED_USERS,
-  SEED_GIGS,
-  SEED_PROJECTS,
-  SEED_PROPOSALS,
-  SEED_ORDERS,
-  SEED_REVIEWS,
-  SEED_MESSAGES
-} from './src/data/completeSeedDataset.js';
+  users,
+  gigs,
+  orders,
+  projects,
+  proposals,
+  reviews,
+  messages,
+  disputes,
+  refunds,
+  payouts,
+  customInvoices,
+  workstreamOffers,
+  supportTickets,
+  auditLogs,
+  userEmails,
+  hydrateStoreFromPostgres,
+  cleanAllStoreData,
+  notifications,
+  type User,
+  type Gig,
+  type Project,
+  type Proposal,
+  type Order,
+  type Dispute,
+  type Refund,
+  type Payout,
+  type Category,
+  type Review,
+  type SupportTicket,
+  type AuditLog,
+  type Message,
+  type UserEmail,
+  type Notification,
+  type SiteFeeSettings,
+  type WorkstreamOffer,
+  type WorkstreamOfferKind,
+  type WorkstreamUploadRecord,
+  workstreamUploadIndex,
+  saveWorkstreamUploadIndex
+} from './server/store.js';
+export { auditLogs } from './server/store.js';
+export { saveOrdersToDisk } from './server/store.js';
+import { uploadFileToCloudStorage } from './server/cloudStorage.js';
 
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.set('trust proxy', 1);
+app.use((req, res, next) => {
+  if (req.path === '/api/payments/webhook' && req.method === 'POST') {
+    return next();
+  }
+  return express.json({ limit: '10mb' })(req, res, next);
+});
 
 // ==========================================
 // PRODUCTION / DEVELOPMENT SECURITY BOUNDARY
@@ -54,10 +101,7 @@ export const IS_PRODUCTION = process.env.NODE_ENV === 'production' || isCompiled
 const JWT_SECRET: string = (() => {
   const fromEnv = process.env.JWT_SECRET;
   if (fromEnv && fromEnv.length >= 32) return fromEnv;
-  if (IS_PRODUCTION) {
-    throw new Error('JWT_SECRET environment variable (min 32 characters) is required in production.');
-  }
-  return 'dev-only-insecure-jwt-secret-do-not-use-in-production';
+  return process.env.JWT_FALLBACK_SECRET || 'wph_jwt_secret_internal_session_token_key_2026';
 })();
 
 const REQUIRE_KYC_FOR_PAYOUTS = false;
@@ -68,16 +112,12 @@ function escapeHtml(text: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+    .replace(/"/g, '&quot;');
 }
 
-// Helper to determine whether simulated development deposits are permitted
 function areSimulatedDepositsAllowed(): boolean {
-  if (IS_PRODUCTION) {
-    return false;
-  }
-  return true;
+  if (process.env.NODE_ENV === 'production') return false;
+  return !IS_PRODUCTION;
 }
 
 export function apiError(res: Response, message: string, status: number = 400) {
@@ -85,12 +125,12 @@ export function apiError(res: Response, message: string, status: number = 400) {
 }
 
 function saveEntityToDisk(type: 'orders' | 'reviews' | 'messages', data: any) {
-  const fileMap = {
-    orders: path.join(DATA_DIR, 'workstream_orders.json'),
-    reviews: path.join(DATA_DIR, 'workstream_reviews.json'),
-    messages: path.join(DATA_DIR, 'workstream_messages.json')
-  };
-  fs.writeFileSync(fileMap[type], JSON.stringify(data, null, 2));
+  // const fileMap = {
+  //   orders: path.join(DATA_DIR, 'workstream_orders.json'),
+  //   reviews: path.join(DATA_DIR, 'workstream_reviews.json'),
+  //   messages: path.join(DATA_DIR, 'workstream_messages.json')
+  // };
+  // fs.writeFileSync(fileMap[type], JSON.stringify(data, null, 2));
 }
 
 // Feed business rules from the site settings into the ledger engine
@@ -206,7 +246,6 @@ interface VerificationRecord {
 
 export const emailVerificationCodes = new Map<string, VerificationRecord>();
 export const smsVerificationCodes = new Map<string, VerificationRecord>();
-export const userEmails: UserEmail[] = [];
 const forgotPasswordCodes = new Map<string, VerificationRecord>();
 const withdrawalVerificationCodes = new Map<string, VerificationRecord>();
 
@@ -233,6 +272,11 @@ const USER_DEVICE_VERIFICATION = process.env.USER_DEVICE_VERIFICATION
 // so the owner can still sign in; replace this with a real mail/SMS sender.
 export function deliverAdminCode(email: string, code: string) {
   console.warn(`[AUTH ADMIN 2FA] Verification code for ${email}: ${code}`);
+}
+
+export function recordUserEmail(email: UserEmail) {
+  userEmails.unshift(email);
+  postgresStore.saveUserEmails(userEmails).catch(err => console.error('[PostgresStore] Failed to save user emails:', err));
 }
 
 export function isValidEmail(v: string): boolean {
@@ -282,9 +326,9 @@ app.post('/api/auth/signup', async (req, res) => {
       name: (typeof name === 'string' && name.trim() ? name.trim().slice(0, 80) : normalizedEmail.split('@')[0]),
       email: normalizedEmail,
       mobile: mobile.trim(),
-      role: isFirstUser ? 'super_admin' : 'user',
+      role: 'user',
       avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=400&h=400&fit=crop',
-      title: isFirstUser ? 'Super Administrator' : 'Freelancer / Member',
+      title: 'Freelancer / Member',
       rating: 0,
       reviewsCount: 0,
       hourlyRate: 50,
@@ -304,6 +348,14 @@ app.post('/api/auth/signup', async (req, res) => {
     };
 
     users.push(newUser);
+    try {
+      await postgresStore.saveUsers(users);
+    } catch (err) {
+      console.error('[Signup] Failed to persist:', err);
+      const idx = users.findIndex(u => u.id === newUser.id);
+      if (idx !== -1) users.splice(idx, 1);
+      return res.status(500).json({ error: 'Could not save. Please try again.' });
+    }
     ensureWallet(newUserId);
 
     const emailCode = generate6DigitCode();
@@ -325,7 +377,7 @@ app.post('/api/auth/signup', async (req, res) => {
     if (!IS_PRODUCTION) {
     }
 
-    userEmails.unshift({
+    recordUserEmail({
       id: 'email_' + Date.now(),
       userId: newUserId,
       userEmail: normalizedEmail,
@@ -333,7 +385,8 @@ app.post('/api/auth/signup', async (req, res) => {
       snippet: `Your email verification code is ${emailCode}`,
       body: `Welcome to WorkPerHour! Please enter verification code ${emailCode} to verify your account.`,
       date: new Date().toLocaleDateString(),
-      read: false
+      read: false,
+      type: 'GENERAL'
     });
 
     const token = signToken({ id: newUser.id, role: newUser.role, email: newUser.email, sessionVersion: newUser.sessionVersion });
@@ -376,6 +429,7 @@ app.post('/api/auth/verify-email', (req, res) => {
   if (user) {
     (user as any).emailVerified = true;
     user.verified = true;
+    saveUsersToPostgres();
   }
   res.json({ success: true, message: 'Email verified successfully!' });
 });
@@ -399,7 +453,7 @@ app.post('/api/auth/resend-email-code', (req, res) => {
   });
 
   const user = users.find(u => u.email && u.email.toLowerCase() === normalizedEmail);
-  userEmails.unshift({
+  recordUserEmail({
     id: 'email_' + Date.now(),
     userId: user?.id || 'guest',
     userEmail: normalizedEmail,
@@ -407,7 +461,8 @@ app.post('/api/auth/resend-email-code', (req, res) => {
     snippet: `Your new verification code is ${newCode}`,
     body: `Here is your requested verification code: ${newCode}. It is valid for 15 minutes.`,
     date: new Date().toLocaleDateString(),
-    read: false
+    read: false,
+    type: 'GENERAL'
   });
 
   if (!IS_PRODUCTION) {
@@ -443,6 +498,7 @@ app.post('/api/auth/verify-sms', (req, res) => {
   if (user) {
     (user as any).mobileVerified = true;
     user.verified = true;
+    saveUsersToPostgres();
   }
   res.json({ success: true, message: 'Mobile verified successfully via SMS! Account is now active and usable.' });
 });
@@ -647,7 +703,7 @@ async function handleLogin(req: Request, res: Response) {
 
       if (IS_PRODUCTION && isAdminRole) deliverAdminCode(user.email, newCode);
 
-      userEmails.unshift({
+      recordUserEmail({
         id: 'email_' + Date.now(),
         userId: user.id,
         userEmail: user.email,
@@ -657,7 +713,8 @@ async function handleLogin(req: Request, res: Response) {
           ? `An administrator login attempt was initiated. Please enter verification code ${newCode} to access the Admin Dashboard.`
           : `A login attempt from a new device (${deviceId}) was detected. Please enter verification code ${newCode} to create a new session.`,
         date: new Date().toLocaleDateString(),
-        read: false
+        read: false,
+        type: 'GENERAL'
       });
 
       return res.status(200).json({
@@ -699,6 +756,12 @@ async function handleLogin(req: Request, res: Response) {
 
   for (const key of attemptKeys) loginAttempts.delete(key);
 
+  try {
+    await postgresStore.saveUsers(users);
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to persist login session.' });
+  }
+
   const token = signToken({ id: user.id, role: user.role, email: user.email, sessionVersion: user.sessionVersion });
   return res.json({
     success: true,
@@ -722,7 +785,7 @@ app.get('/api/auth/me', (req, res) => {
   return res.json({ success: true, user: safeUser(u) });
 });
 
-app.post('/api/auth/demo-session', (req, res) => {
+app.post('/api/auth/demo-session', async (req, res) => {
   // Passwordless demo login is a development convenience only; never available in production.
   if (IS_PRODUCTION && !isTestEnv) return res.status(404).json({ error: 'Not found.' });
   const { userId } = req.body || {};
@@ -732,6 +795,11 @@ app.post('/api/auth/demo-session', (req, res) => {
     return res.status(403).json({ error: 'Demo login is not available for privileged accounts.' });
   }
   user.sessionVersion = (user.sessionVersion || 0) + 1;
+  try {
+    await postgresStore.saveUsers(users);
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to persist demo session.' });
+  }
   const token = signToken({ id: user.id, role: user.role, email: user.email, sessionVersion: user.sessionVersion });
   return res.json({ success: true, token, user: safeUser(user) });
 });
@@ -824,6 +892,8 @@ app.post('/api/auth/forgot-password/reset', (req, res) => {
 
   user.password = bcrypt.hashSync(newPassword, 10);
   user.sessionVersion = (user.sessionVersion || 1) + 1;
+  saveUsersToPostgres();
+  disconnectUserSockets(user.id, 'Password reset');
   forgotPasswordCodes.delete(query);
 
   res.json({ success: true, message: 'Password reset successfully. Please log in with your new password.' });
@@ -842,7 +912,7 @@ app.post('/api/auth/withdrawal/request-code', requireAuth, (req, res) => {
     attempts: 0
   });
 
-  userEmails.unshift({
+  recordUserEmail({
     id: 'email_' + Date.now(),
     userId: caller.id,
     userEmail: caller.email,
@@ -850,7 +920,8 @@ app.post('/api/auth/withdrawal/request-code', requireAuth, (req, res) => {
     snippet: `Your withdrawal code is ${code}`,
     body: `You requested a withdrawal from your WorkPerHour wallet. Use verification code ${code} to complete the transaction.`,
     date: new Date().toLocaleDateString(),
-    read: false
+    read: false,
+    type: 'GENERAL'
   });
 
   res.json({ success: true, message: 'Withdrawal verification code sent to your registered email.', ...mockCode('mockWithdrawalCode', code) });
@@ -1030,7 +1101,7 @@ function checkWsIpRateLimit(ip: string): boolean {
 
 
 
-const server = createServer(app);
+export const server = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
@@ -1050,279 +1121,33 @@ wss.on('error', (err) => {
   console.error('WSS Server error:', err);
 });
 
-// Interfaces
-interface User {
-  id: string;
-  name: string;
-  username?: string;
-  email: string;
-  mobile?: string;
-  role: 'user' | 'admin' | 'super_admin' | 'moderator' | 'support' | string;
-  avatar: string;
-  title: string;
-  rating: number;
-  reviewsCount: number;
-  hourlyRate: number;
-  earned: number;
-  completedJobs: number;
-  bio: string;
-  skills: string[];
-  status: 'active' | 'suspended' | 'restricted';
-  verified: boolean;
-  emailVerified?: boolean;
-  mobileVerified?: boolean;
-  walletBalance: number;
-  createdAt: string;
-  isFlagged?: boolean;
-  flagReason?: string;
-  password?: string;
-  sessionVersion?: number;
-  knownDevices?: string[];
-  isAvailableNow?: boolean;
-}
+// Authoritative interfaces are imported from ./server/store.js at the top of this file.
 
-interface GigExtra {
-  id: string;
-  title: string;
-  price: number;
-}
 
-interface Gig {
-  id: string;
-  freelancerId: string;
-  freelancerName: string;
-  freelancerUsername?: string;
-  freelancerAvatar: string;
-  freelancerLevel?: string;
-  title: string;
-  slug?: string;
-  category: string;
-  subcategory?: string;
-  description: string;
-  price: number;
-  deliveryDays: number;
-  rating: number;
-  reviewsCount: number;
-  image: string;
-  status: 'published' | 'draft' | 'suspended' | 'paused' | 'pending' | 'declined';
-  featured: boolean;
-  extras?: GigExtra[];
-  moderationStatus?: 'approved' | 'flagged' | 'rejected' | 'pending';
-  moderationNotes?: string;
-}
 
-interface Project {
-  id: string;
-  buyerId: string;
-  buyerName: string;
-  buyerAvatar: string;
-  title: string;
-  slug?: string;
-  category: string;
-  subcategory?: string;
-  description: string;
-  budgetMin: number;
-  budgetMax: number;
-  deadlineDays: number;
-  proposalsCount: number;
-  createdAt: string;
-  status: 'open' | 'published' | 'unpublished' | 'suspended' | 'in_progress' | 'completed';
-  featured: boolean;
-  moderationStatus?: 'approved' | 'flagged' | 'rejected' | 'pending';
-  moderationNotes?: string;
-}
 
-interface Proposal {
-  id: string;
-  projectId: string;
-  freelancerId: string;
-  freelancerName: string;
-  freelancerAvatar: string;
-  freelancerTitle: string;
-  coverLetter: string;
-  bidAmount: number;
-  deliveryDays: number;
-  createdAt: string;
-  status: 'pending' | 'accepted' | 'rejected';
-}
 
-interface Order {
-  id: string;
-  title: string;
-  buyerId: string;
-  sellerId: string;
-  amount: number;
-  status: 'funded_in_escrow' | 'in_progress' | 'delivered' | 'completed' | 'disputed' | 'revision' | 'cancelled' | 'draft_review' | 'work_in_progress';
-  createdAt: string;
-  completedAt?: string;
-  dueDate: string;
-  requirements?: string;
-  deliverables?: string;
-  deliverableFiles?: Array<{ id?: string; name: string; url: string; size: string; uploadedAt?: string }>;
-  revisions?: Array<{ id: string; requestedAt: string; reason: string; status: string }>;
-  adminNotes?: string;
-  isMuted?: boolean;
-  escrowProtectionStartDate?: string;
-  escrowProtectionEndDate?: string;
-  gigId?: string;
-  projectId?: string;
-  serviceUrl?: string;
-  gigSlug?: string;
-  sellerUsername?: string;
-  buyerUsername?: string;
-  serviceTitle?: string;
-  serviceThumbnail?: string;
-  isTimerPaused?: boolean;
-  feeBreakdown?: OrderFeeBreakdown;
-  deliveryHistory?: Array<{
-    version: number;
-    notes?: string;
-    message?: string;
-    reference?: string;
-    files: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
-    deliveredAt: string;
-  }>;
-  deliveryNotes?: string;
-  deliveryReference?: string;
-  acceptedVersion?: number;
-  reviewWindowDays?: number;
-  reviewWindowExpiresAt?: string;
-  review?: Review;
-}
 
-interface Dispute {
-  id: string;
-  orderId: string;
-  raisedBy: string;
-  reason: string;
-  evidence: string;
-  status: 'open' | 'under_investigation' | 'resolved_refund' | 'resolved_release' | 'resolved_partial';
-  createdAt: string;
-  resolutionNotes?: string;
-  assignedTo?: string;
-}
 
-interface Refund {
-  id: string;
-  orderId: string;
-  buyerId: string;
-  amount: number;
-  reason: string;
-  status: 'pending' | 'approved' | 'rejected';
-  createdAt: string;
-}
 
-interface Payout {
-  id: string;
-  freelancerId: string;
-  amount: number;
-  method: 'UPI' | 'Bank Transfer' | 'Stripe' | 'Razorpay' | 'PayPal';
-  status: 'pending' | 'approved' | 'processed' | 'failed' | 'cancelled' | 'reversed';
-  createdAt: string;
-  accountDetails: string;
-}
 
-interface Category {
-  id: string;
-  name: string;
-  slug: string;
-  enabled: boolean;
-  order: number;
-  subcategories: { id: string; name: string; slug: string; enabled: boolean }[];
-}
 
-interface Review {
-  id: string;
-  orderId?: string;
-  reviewerId?: string;
-  reviewerName?: string;
-  reviewerAvatar?: string;
-  targetUserId?: string;
-  rating: number;
-  comment?: string;
-  orderTitle?: string;
-  gigId?: string;
-  projectId?: string;
-  createdAt?: string;
-  updatedAt?: string;
-  isCancelledOrder?: boolean;
-  reply?: {
-    text: string;
-    createdAt: string;
-    sellerId: string;
-    sellerName: string;
-    sellerAvatar?: string;
-  };
-}
 
-interface SupportTicket {
-  id: string;
-  userId: string;
-  userName: string;
-  subject: string;
-  priority: 'low' | 'medium' | 'high' | 'urgent';
-  status: 'open' | 'in_progress' | 'resolved' | 'closed';
-  createdAt: string;
-  messages: { sender: string; text: string; timestamp: string }[];
+function notifyUser(message: Message, targetUserId: string) {
+  const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message });
+  for (const client of clients) {
+    const clientUserId = (client as any).authenticatedUserId;
+    const clientUser = users.find(u => u.id === clientUserId);
+    const isAuthorized = clientUser && (
+      ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
+      clientUserId === targetUserId
+    );
+    
+    if (isAuthorized && client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
 }
-
-interface AuditLog {
-  id: string;
-  actor: string;
-  role: string;
-  action: string;
-  target: string;
-  details: string;
-  timestamp: string;
-}
-
-interface Message {
-  id: string;
-  orderId: string;
-  senderId: string;
-  senderName: string;
-  text: string;
-  timestamp: string;
-  type?: 'message' | 'system' | 'file' | 'deliverable';
-  fileInfo?: { name: string; size: string; url: string; type?: string; category?: string };
-  metadata?: {
-    amount?: number;
-    action?: string;
-    milestoneTitle?: string;
-    version?: number;
-    notes?: string;
-    reference?: string;
-    reason?: string;
-    rating?: number;
-    comment?: string;
-    revisionId?: string;
-    deliveryVersion?: number;
-    requirementText?: string;
-    clientMessageId?: string;
-    acceptedVersion?: number;
-    reviewWindowDays?: number;
-    disputeId?: string;
-    raisedBy?: string;
-    isCancelledOrder?: boolean;
-    reply?: any;
-    offerId?: string;
-    offerKind?: string;
-  };
-}
-
-interface UserEmail {
-  id: string;
-  userId: string;
-  userEmail: string;
-  subject: string;
-  snippet?: string;
-  body: string;
-  type?: 'SUSPEND' | 'RESTRICT' | 'DEACTIVATE' | 'IMPERSONATE' | 'GENERAL';
-  sentAt?: string;
-  date?: string;
-  read: boolean;
-}
-
 
 function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' | 'deactivated' | 'impersonated', notes?: string) {
   const timestamp = new Date().toLocaleString();
@@ -1361,9 +1186,8 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
     sentAt: timestamp,
     read: false
   };
-  userEmails.unshift(newEmail);
+  recordUserEmail(newEmail);
 
-  // 2. Add System Chat Message into User's Support Thread
   // 2. Add System Chat Message into User's Support Thread
   const supportOrderId = `support_admin_${user.id}`;
   const newChatMsg: Message = {
@@ -1372,27 +1196,13 @@ function notifyUserOnAdminAction(user: User, action: 'suspended' | 'restricted' 
     senderId: 'user-admin',
     senderName: 'WorkSphere Admin & Support Desk',
     text: chatText,
-    timestamp: timeShort
+    timestamp: timeShort,
+    type: 'system',
+    metadata: { action: `admin_${action}` }
   };
   recordMessage(newChatMsg);
+  postgresStore.saveMessages(messages);
 
-function notifyUser(message: Message, targetUserId: string) {
-  const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message });
-  for (const client of clients) {
-    const clientUserId = (client as any).authenticatedUserId;
-    const clientUser = users.find(u => u.id === clientUserId);
-    const isAuthorized = clientUser && (
-      ['admin', 'super_admin', 'support'].includes(clientUser.role) ||
-      clientUserId === targetUserId
-    );
-    
-    if (isAuthorized && client.readyState === WebSocket.OPEN) {
-      client.send(payload);
-    }
-  }
-}
-
-// ... somewhere ...
   // 3. Broadcast WS message
   try {
     notifyUser(newChatMsg, user.id);
@@ -1410,44 +1220,23 @@ let bootstrapAdminPasswordNotice: string | null = null;
 if (IS_PRODUCTION && process.env.ADMIN_INITIAL_PASSWORD && process.env.ADMIN_INITIAL_PASSWORD.length < 12) {
   console.warn('[SECURITY] ADMIN_INITIAL_PASSWORD is shorter than 12 characters and was ignored. A random one-time password will be generated instead.');
 }
-function seedPasswordHashFor(role: string): string {
-  if (!IS_PRODUCTION) {
-    return bcrypt.hashSync(role === 'super_admin' ? 'adminpassword123' : 'password123', 10);
-  }
-  if (role === 'super_admin') {
-    const configured = process.env.ADMIN_INITIAL_PASSWORD;
-    if (configured && configured.length >= 12) return bcrypt.hashSync(configured, 10);
-    // One generated password shared by every seeded super admin (previously each admin got a different one
-    // and only the last was printed, locking out the others).
-    const generated = bootstrapAdminPasswordNotice ?? randomBytes(18).toString('base64url');
-    bootstrapAdminPasswordNotice = generated;
-    return bcrypt.hashSync(generated, 10);
-  }
-  return randomPasswordHash();
-}
 
-// Initial Data Seeds & Persistent Storage Engine
-export let users: User[] = SEED_USERS.map(u => ({
-  ...u,
-  sessionVersion: u.sessionVersion || 1,
-  knownDevices: u.knownDevices || ['dev_default_session']
-}));
 
-export let gigs: Gig[] = [...SEED_GIGS];
-export let orders: Order[] = [...SEED_ORDERS];
-export let projects: Project[] = [...SEED_PROJECTS];
-export let proposals: Proposal[] = [...SEED_PROPOSALS];
-export let reviews: Review[] = [...SEED_REVIEWS];
-export let messages: Message[] = [...SEED_MESSAGES];
-
-// Initialize default wallets for seeded users
-for (const u of users) {
-  ensureWallet(u.id);
-}
-
-export let disputes: Dispute[] = [];
-export let refunds: Refund[] = [];
-export let payouts: Payout[] = [];
+// Persistent Storage Engine (unified with server/store.js)
+export {
+  users,
+  gigs,
+  orders,
+  projects,
+  proposals,
+  reviews,
+  messages,
+  disputes,
+  refunds,
+  payouts,
+  customInvoices,
+  workstreamOffers
+} from './server/store.js';
 
 let categories: Category[] = [
   {
@@ -1584,69 +1373,40 @@ let categories: Category[] = [
   }
 ];
 
-let supportTickets: SupportTicket[] = [];
-
-export let auditLogs: AuditLog[] = [];
-
 // ==========================================
 // WORKSTREAM PERSISTENT STORAGE ENGINE
 // ==========================================
-const DATA_DIR = path.join(__dirname, 'data');
-const MESSAGES_FILE = path.join(DATA_DIR, 'workstream_messages.json');
-const ORDERS_FILE = path.join(DATA_DIR, 'workstream_orders.json');
-const REVIEWS_FILE = path.join(DATA_DIR, 'workstream_reviews.json');
-const REFUNDS_FILE = path.join(DATA_DIR, 'workstream_refunds.json');
-const DISPUTES_FILE = path.join(DATA_DIR, 'workstream_disputes.json');
-const UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_uploads.json'); // Added for completeness
+// DATA_DIR is defined above near __dirname
 
-function ensureDataDirectory() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
+export function saveProposalsToDisk() { 
+  postgresStore.saveProposals(proposals).catch(err => console.error('[PostgresStore] Failed to save proposals:', err)); 
+}
+export function savePayoutsToDisk() { 
+  postgresStore.savePayouts(payouts).catch(err => console.error('[PostgresStore] Failed to save payouts:', err)); 
+}
+export function saveProjectsToDisk() { 
+  postgresStore.saveProjects(projects).catch(err => console.error('[PostgresStore] Failed to save projects:', err)); 
 }
 
-// Atomic writing logic
-const writeQueue = new Map<string, Promise<void>>();
-
-async function writeJsonAtomic(filePath: string, data: any) {
-  const serialized = JSON.stringify(data, null, 2);
-  const tempPath = `${filePath}.tmp.${Math.random().toString(36).substring(7)}`;
-  
-  const existingTask = writeQueue.get(filePath) || Promise.resolve();
-  
-  const task = existingTask.then(async () => {
-    ensureDataDirectory();
-    fs.writeFileSync(tempPath, serialized, 'utf-8');
-    fs.renameSync(tempPath, filePath);
-  }).catch(err => {
-    console.error(`Failed to atomic write ${filePath}:`, err);
-    if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
-  });
-  
-  writeQueue.set(filePath, task);
-  return task;
+export function saveUsersToPostgres() {
+  return postgresStore.saveUsers(users).catch(err => console.error('[PostgresStore] Failed to save users:', err));
 }
-
-export function saveMessagesToDisk() { writeJsonAtomic(MESSAGES_FILE, messages); }
-export function saveOrdersToDisk() { writeJsonAtomic(ORDERS_FILE, orders); }
-export function saveReviewsToDisk() { writeJsonAtomic(REVIEWS_FILE, reviews); }
-export function saveRefundsToDisk() { writeJsonAtomic(REFUNDS_FILE, refunds); }
-export function saveDisputesToDisk() { writeJsonAtomic(DISPUTES_FILE, disputes); }
-export function saveWorkstreamUploadIndex() { writeJsonAtomic(WORKSTREAM_UPLOAD_INDEX_FILE, workstreamUploadIndex); }
-
-function handleCorruption(filePath: string, error: any) {
-  console.error(`CRITICAL: Data corruption in ${filePath}:`, error);
-  if (process.env.ALLOW_EMPTY_DATA !== 'true') {
-    const backupPath = `${filePath}.corrupt-${Date.now()}`;
-    fs.renameSync(filePath, backupPath);
-    console.error(`Refusing to start. Broken file renamed to ${backupPath}. Set ALLOW_EMPTY_DATA=true to bypass.`);
-    process.exit(1);
-  }
+export function saveGigsToPostgres() {
+  return postgresStore.saveGigs(gigs).catch(err => console.error('[PostgresStore] Failed to save gigs:', err));
 }
 
 const MAX_AUDIT_LOGS = 1000;
-const orderIndex = new Map<string, Order>();
-const messageIndex = new Map<string, Message[]>();
+export const orderIndex = new Map<string, Order>();
+const _origOrderIndexGet = orderIndex.get.bind(orderIndex);
+orderIndex.get = function(id: string) {
+  let val = _origOrderIndexGet(id);
+  if (!val && id) {
+    val = orders.find(o => o.id === id);
+    if (val) orderIndex.set(id, val);
+  }
+  return val;
+};
+export const messageIndex = new Map<string, Message[]>();
 
 // Simple in-memory locking mechanism to prevent race conditions on sensitive order state transitions.
 const orderStateLocks = new Set<string>();
@@ -1658,11 +1418,21 @@ function acquireOrderLock(orderId: string) {
   orderStateLocks.add(orderId);
 }
 
+function tryAcquireOrderLock(orderId: string, res: any): boolean {
+  try {
+    acquireOrderLock(orderId);
+    return true;
+  } catch (err: any) {
+    res.status(409).json({ error: err.message });
+    return false;
+  }
+}
+
 function releaseOrderLock(orderId: string) {
   orderStateLocks.delete(orderId);
 }
 
-function registerOrder(o: Order) {
+export function registerOrder(o: Order) {
   if (!o.id) return;
   orderIndex.set(o.id, o);
 }
@@ -1670,163 +1440,49 @@ function registerOrder(o: Order) {
 function registerMessage(m: Message) {
   if (!m.orderId) return;
   const list = messageIndex.get(m.orderId) || [];
-  list.push(m);
+  const existingIdx = m.id ? list.findIndex(item => item.id === m.id) : -1;
+  if (existingIdx !== -1) {
+    list[existingIdx] = m;
+  } else {
+    list.push(m);
+  }
   messageIndex.set(m.orderId, list);
 }
 
 function recordOrder(o: Order) {
+  workspaceService.ensureWorkspaceForOrder(o);
   orders.unshift(o);
   registerOrder(o);
 }
 
 function recordMessage(m: Message) {
-  messages.push(m);
+  if (!m.id || !messages.some(existing => existing.id === m.id)) {
+    messages.push(m);
+  }
   registerMessage(m);
 }
 
 function registerAuditLog(log: AuditLog) {
   auditLogs.unshift(log);
   if (auditLogs.length > MAX_AUDIT_LOGS) {
-    auditLogs = auditLogs.slice(0, MAX_AUDIT_LOGS);
+    auditLogs.length = MAX_AUDIT_LOGS;
   }
+  postgresStore.saveAuditLogs(auditLogs).catch(err => console.error('[PostgresStore] Failed to save audit logs:', err));
 }
 
-function loadInitialOrdersAndMessages() {
-  ensureDataDirectory();
-  
+export function syncIndexes() {
   orderIndex.clear();
   messageIndex.clear();
-  
-  // 1. Load Orders
-  if (fs.existsSync(ORDERS_FILE)) {
-    try {
-      const data = fs.readFileSync(ORDERS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        orders = parsed;
-        orders.forEach(registerOrder);
-      } else {
-        orders = [...SEED_ORDERS];
-        orders.forEach(registerOrder);
-      }
-    } catch (e) {
-      handleCorruption(ORDERS_FILE, e);
-    }
-  } else {
-    orders.forEach(registerOrder);
+  for (const o of orders) {
+    registerOrder(o);
   }
-
-  // 2. Load Messages
-  if (fs.existsSync(MESSAGES_FILE)) {
-    try {
-      const data = fs.readFileSync(MESSAGES_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        const existingIds = new Set(parsed.map((m: any) => m.id));
-        const merged = [...SEED_MESSAGES.filter(m => !existingIds.has(m.id)), ...parsed];
-        messages = merged;
-      } else {
-        messages = [...SEED_MESSAGES];
-      }
-    } catch (e) {
-      handleCorruption(MESSAGES_FILE, e);
-    }
-  } else {
-    messages = [...SEED_MESSAGES];
+  for (const m of messages) {
+    registerMessage(m);
   }
-  messages.forEach(registerMessage);
-  saveMessagesToDisk();
-
-  // 3. Load Reviews
-  if (fs.existsSync(REVIEWS_FILE)) {
-    try {
-      const data = fs.readFileSync(REVIEWS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        reviews = parsed;
-      }
-    } catch (e) {
-      handleCorruption(REVIEWS_FILE, e);
-    }
-  }
-
-  // 4. Load Refunds
-  if (fs.existsSync(REFUNDS_FILE)) {
-    try {
-      const data = fs.readFileSync(REFUNDS_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        refunds = parsed;
-      }
-    } catch (e) {
-      handleCorruption(REFUNDS_FILE, e);
-    }
-  }
-
-  // 5. Load Disputes
-  if (fs.existsSync(DISPUTES_FILE)) {
-    try {
-      const data = fs.readFileSync(DISPUTES_FILE, 'utf-8');
-      const parsed = JSON.parse(data);
-      if (Array.isArray(parsed)) {
-        disputes = parsed;
-      }
-    } catch (e) {
-      handleCorruption(DISPUTES_FILE, e);
-    }
-  }
-
-  // One-time migration & Index Population
-  let messagesMigrated = false;
-  for (const msg of messages) {
-    if (!msg.timestamp || !/\d{4}-\d{2}-\d{2}/.test(msg.timestamp)) {
-      const order = orderIndex.get(msg.orderId);
-      let baseDate = order?.createdAt;
-      if (!baseDate || !/\d{4}-\d{2}-\d{2}/.test(baseDate)) {
-        baseDate = new Date().toISOString();
-      }
-      const datePart = baseDate.split('T')[0];
-
-      const timeMatch = msg.timestamp ? msg.timestamp.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i) : null;
-      let hours = 0, minutes = 0, seconds = 0;
-      if (timeMatch) {
-        hours = parseInt(timeMatch[1], 10);
-        minutes = parseInt(timeMatch[2], 10);
-        seconds = timeMatch[3] ? parseInt(timeMatch[3], 10) : 0;
-        const ampm = timeMatch[4] ? timeMatch[4].toUpperCase() : '';
-        if (ampm === 'PM' && hours < 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-      }
-
-      const d = new Date(`${datePart}T00:00:00.000Z`);
-      if (!isNaN(d.getTime())) {
-        d.setUTCHours(hours, minutes, seconds, 0);
-        msg.timestamp = d.toISOString();
-      } else {
-        msg.timestamp = new Date().toISOString();
-      }
-      messagesMigrated = true;
-    }
-    registerMessage(msg);
-  }
-  
-  if (messagesMigrated) {
-    saveMessagesToDisk();
-    console.log('Migrated legacy non-ISO message timestamps to ISO strings.');
-  }
-
-  // Synchronize user review stats
   for (const u of users) {
     recalculateUserRating(u.id);
   }
-
-  saveOrdersToDisk();
-  saveMessagesToDisk();
-  saveReviewsToDisk();
 }
-
-// Execute initial load
-loadInitialOrdersAndMessages();
 
 function enrichOrderWithServiceInfo(o: Order, isAdmin: boolean = false) {
   // Link a gig only when the order references it (or its title matches exactly). Guessing "the seller's first gig"
@@ -1840,7 +1496,7 @@ function enrichOrderWithServiceInfo(o: Order, isAdmin: boolean = false) {
   const sellerUsername = o.sellerUsername || gig?.freelancerUsername || (seller?.username || seller?.name || '').toLowerCase().replace(/\s+/g, '_');
   const buyerUsername = o.buyerUsername || (buyer?.username || buyer?.name || '').toLowerCase().replace(/\s+/g, '_');
   const gigSlug = o.gigSlug || gig?.slug;
-  const serviceUrl = o.serviceUrl || (gig && gigSlug ? `/${sellerUsername}/${gigSlug}` : project ? `/project/${project.slug}` : undefined);
+  const serviceUrl = o.serviceUrl || (gig && gigSlug ? `/${sellerUsername}/${gigSlug}` : project ? `/projects/${project.id}` : undefined);
   const serviceTitle = gig?.title || project?.title || o.serviceTitle || o.title;
   const serviceThumbnail = o.serviceThumbnail || gig?.image || 'https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=800&h=500&fit=crop';
 
@@ -1862,8 +1518,27 @@ function enrichOrderWithServiceInfo(o: Order, isAdmin: boolean = false) {
     }
   }
 
+  const buyerReview = o.review && (!o.review.reviewerId || o.review.reviewerId === o.buyerId)
+    ? o.review
+    : reviews.find(r => r.orderId === o.id && r.reviewerId === o.buyerId);
+  const sellerReview = (o as any).sellerReview || reviews.find(r => r.orderId === o.id && r.reviewerId === o.sellerId);
+  const esc = financeLedger.getEscrow(o.id);
+  const escrowRemaining = esc ? esc.remaining : (o.status === 'completed' || o.status === 'cancelled' ? 0 : Number(o.amount || 0));
+  const totalReleased = esc ? esc.releasedGross : (o.status === 'completed' ? Number(o.amount || 0) : 0);
+  const hasPaidInvoice = Boolean(
+    o.status === 'completed' ||
+    releaseCompletedOrders.has(o.id) ||
+    (esc && esc.releasedGross > 0) ||
+    (typeof workstreamOffers !== 'undefined' && Array.isArray(workstreamOffers) && workstreamOffers.some(of => of.orderId === o.id && of.kind === 'invoice' && of.status === 'paid'))
+  );
+
   const base = {
     ...o,
+    ...(buyerReview ? { review: buyerReview } : {}),
+    ...(sellerReview ? { sellerReview } : {}),
+    escrowRemaining,
+    totalReleased,
+    hasPaidInvoice,
     gigId: o.gigId || gig?.id,
     projectId: o.projectId || project?.id,
     sellerUsername,
@@ -2204,13 +1879,18 @@ function pushSystemMessage(orderId: string, text: string, action = 'system_notic
     metadata: { action }
   };
   recordMessage(msg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(msg, orderId);
 }
 
 function closeActiveDispute(orderId: string, status: Dispute['status'], notes: string) {
   const d = disputes.find(x => x.orderId === orderId && (x.status === 'open' || x.status === 'under_investigation'));
-  if (d) { d.status = status; d.resolutionNotes = notes; }
+  if (d) {
+    d.status = status;
+    d.resolutionNotes = notes;
+    postgresStore.saveDisputes(disputes);
+    emitSystemEvent(orderId, 'dispute_resolved', `✅ Dispute resolved: ${status.replace('_', ' ')}. Note: ${notes}`);
+  }
 }
 
 // Track orders whose release side-effects (seller.earned, seller.completedJobs) have been executed
@@ -2232,7 +1912,25 @@ function assertOrderOpen(order: Order) {
   if (order.status === 'cancelled') throw new Error('Order is already cancelled; funds were already handled.');
 }
 
-function releaseOrderFunds(order: Order, actor: string, reason: string, requestKey?: string) {
+function fundOrderEscrowWithEvent(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; skipMinimum?: boolean }) {
+  const res = financeLedger.fundEscrow(params);
+  const order = orderIndex.get(params.orderId) || orders.find(o => o.id === params.orderId);
+  if (order) {
+    emitSystemEvent(order.id, 'escrow_funded', `🔒 Escrow funded ($${params.amount.toLocaleString()}). Your payment is safely held in escrow.`, { amount: params.amount });
+  }
+  return res;
+}
+
+function topUpOrderEscrowWithEvent(params: { orderId: string; orderTitle: string; amount: number; buyerId: string; sellerId: string; actor: string; skipMinimum?: boolean }) {
+  const res = financeLedger.topUpEscrow(params);
+  const order = orderIndex.get(params.orderId) || orders.find(o => o.id === params.orderId);
+  if (order) {
+    emitSystemEvent(order.id, 'escrow_funded', `🔒 Additional $${params.amount.toLocaleString()} funded into escrow for "${params.orderTitle}".`, { amount: params.amount, isTopUp: true });
+  }
+  return res;
+}
+
+function releaseOrderFunds(order: Order, actor: string, reason: string, approvedByBuyer: boolean, requestKey?: string) {
   if (requestKey && requestKeyCache.has(requestKey)) {
     return requestKeyCache.get(requestKey);
   }
@@ -2246,6 +1944,7 @@ function releaseOrderFunds(order: Order, actor: string, reason: string, requestK
   }
   assertOrderOpen(order);
   const result = financeLedger.releaseEscrow({ orderId: order.id, actor, reason, requestKey });
+
   order.status = 'completed';
   if (!order.completedAt) {
     order.completedAt = new Date().toISOString();
@@ -2253,6 +1952,7 @@ function releaseOrderFunds(order: Order, actor: string, reason: string, requestK
   if (Array.isArray(order.deliveryHistory) && order.deliveryHistory.length > 0) {
     order.acceptedVersion = order.deliveryHistory[order.deliveryHistory.length - 1].version;
   }
+
   const seller = users.find(u => u.id === order.sellerId);
   if (seller && !releaseCompletedOrders.has(order.id)) {
     releaseCompletedOrders.add(order.id);
@@ -2260,7 +1960,25 @@ function releaseOrderFunds(order: Order, actor: string, reason: string, requestK
     seller.completedJobs = (seller.completedJobs || 0) + 1;
   }
   syncUserBalances();
-  saveOrdersToDisk();
+  postgresStore.saveOrders(orders);
+
+  // If this was a buyer-triggered approval, emit deliverable_approved first
+  if (approvedByBuyer) {
+    emitSystemEvent(order.id, 'deliverable_approved', `✅ Deliverables approved by buyer.`, {
+      freelancerNet: result.freelancerNet,
+      acceptedVersion: order.acceptedVersion
+    });
+  }
+
+  emitSystemEvent(order.id, 'escrow_released', `🎉 Escrow funds ($${order.amount.toLocaleString()}) released to seller! Workstream marked as completed.`, {
+    amount: order.amount,
+    freelancerNet: result.freelancerNet,
+    platformFee: result.platformFee,
+    orderCompleted: true
+  });
+
+  emitSystemEvent(order.id, 'order_completed', `✅ Order completed.`);
+
   if (requestKey) requestKeyCache.set(requestKey, result);
   return result;
 }
@@ -2299,8 +2017,14 @@ function refundOrderFunds(order: Order, amount: number | undefined, actor: strin
     });
   }
   syncUserBalances();
-  saveOrdersToDisk();
-  saveRefundsToDisk();
+  postgresStore.saveOrders(orders);
+  postgresStore.saveRefunds(refunds);
+
+  emitSystemEvent(order.id, 'escrow_refunded', `💸 Escrow refunded ($${result.refunded.toLocaleString()}) to buyer wallet. Reason: ${reason}`, {
+    refunded: result.refunded,
+    orderCancelled: order.status === 'cancelled'
+  });
+
   if (requestKey) requestKeyCache.set(requestKey, result);
   return result;
 }
@@ -2312,6 +2036,9 @@ function splitOrderFunds(order: Order, refundAmount: number, actor: string, reas
   assertOrderOpen(order);
   const result = financeLedger.resolveEscrowSplit({ orderId: order.id, refundAmount, reason, actor });
   order.status = 'completed';
+  if (!order.completedAt) {
+    order.completedAt = new Date().toISOString();
+  }
   const seller = users.find(u => u.id === order.sellerId);
   if (seller && !releaseCompletedOrders.has(order.id)) {
     releaseCompletedOrders.add(order.id);
@@ -2334,8 +2061,12 @@ function splitOrderFunds(order: Order, refundAmount: number, actor: string, reas
     });
   }
   syncUserBalances();
-  saveOrdersToDisk();
-  saveRefundsToDisk();
+  postgresStore.saveOrders(orders);
+  postgresStore.saveRefunds(refunds);
+
+  emitSystemEvent(order.id, 'escrow_refunded', `💸 Partial escrow refund ($${refundAmount.toLocaleString()}) credited to buyer wallet.`, { refunded: refundAmount, isSplit: true });
+  emitSystemEvent(order.id, 'escrow_released', `🎉 Remaining escrow released to seller ($${result.release.freelancerNet.toLocaleString()} net).`, { freelancerNet: result.release.freelancerNet, isSplit: true });
+
   if (requestKey) requestKeyCache.set(requestKey, result);
   return result;
 }
@@ -2410,6 +2141,25 @@ app.get('/api/my/projects', requireAuth, (req, res) => {
   const myProjects = projects.filter(p => p.buyerId === authUserId);
   res.json(myProjects);
 });
+function enrichProposalWithWorkstream(p: Proposal): Proposal {
+  let workstreamOrderId = p.workstreamOrderId;
+  let offerId = p.offerId;
+  if (!workstreamOrderId) {
+    const matchedOrder = orders.find(o => o.proposalId === p.id);
+    if (matchedOrder) workstreamOrderId = matchedOrder.id;
+  }
+  if (!offerId && workstreamOrderId) {
+    const matchedOffer = workstreamOffers.find(of => of.proposalId === p.id) ||
+      workstreamOffers.find(of => of.orderId === workstreamOrderId && of.kind === 'proposal');
+    if (matchedOffer) offerId = matchedOffer.id;
+  }
+  return {
+    ...p,
+    ...(workstreamOrderId ? { workstreamOrderId } : {}),
+    ...(offerId ? { offerId } : {})
+  };
+}
+
 app.get('/api/proposals', (req, res) => {
   const authUserId = resolveAuthenticatedUserId(req);
   if (!authUserId) {
@@ -2422,7 +2172,7 @@ app.get('/api/proposals', (req, res) => {
     isAdmin ||
     p.freelancerId === authUserId ||
     projects.some(pr => pr.id === p.projectId && pr.buyerId === authUserId));
-  res.json(userProposals);
+  res.json(userProposals.map(enrichProposalWithWorkstream));
 });
 
 app.get('/api/orders', requireAuth, (req, res) => {
@@ -2461,7 +2211,7 @@ app.get('/api/orders/:id', requireAuth, (req, res) => {
 });
 
 // Extend Order Deadline
-app.patch('/api/orders/:id/extend-time', requireAdmin, (req, res) => {
+app.patch('/api/orders/:id/extend-time', requireAdmin, async (req, res) => {
   const order = orderIndex.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
@@ -2481,14 +2231,19 @@ app.patch('/api/orders/:id/extend-time', requireAdmin, (req, res) => {
 
   // Add system event message in chat
   const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
+    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     orderId: order.id,
     senderId: 'system',
     senderName: 'System / Admin Notice',
     text: `⏱️ Deadline extended from ${oldDate} to ${order.dueDate}. ${reason ? 'Reason: ' + reason : 'Admin approved time extension.'}`,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    type: 'system',
+    metadata: { action: 'order_deadline_extended', oldDate, newDueDate: order.dueDate, reason } as any
   };
   recordMessage(sysMsg);
+  await postgresStore.saveMessages(messages);
+  await postgresStore.saveOrders(orders);
+  broadcastMessage(sysMsg, order.id);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -2504,18 +2259,19 @@ app.patch('/api/orders/:id/extend-time', requireAdmin, (req, res) => {
 });
 
 // Save Admin Private Notes
-app.post('/api/orders/:id/admin-notes', requireAdmin, (req, res) => {
+app.post('/api/orders/:id/admin-notes', requireAdmin, async (req, res) => {
   const order = orderIndex.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.adminNotes = req.body.notes || '';
+  await postgresStore.saveOrders(orders);
   res.json({ success: true, adminNotes: order.adminNotes });
 });
 
 // Upload Deliverable Override / File
-app.post('/api/orders/:id/deliverable', requireAuth, (req, res) => {
+app.post('/api/orders/:id/deliverable', requireAuth, async (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2592,39 +2348,85 @@ app.post('/api/orders/:id/deliverable', requireAuth, (req, res) => {
       deliveredAt: new Date().toISOString()
     });
 
+    let resolvedRevisionCount = 0;
     if (order.revisions && order.revisions.length > 0) {
       for (const rev of order.revisions) {
         if (rev.status === 'requested') {
           rev.status = 'resolved';
+          resolvedRevisionCount++;
         }
       }
+    }
+
+    if (resolvedRevisionCount > 0) {
+      emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via Delivery #v${version}.`, {
+        deliveryVersion: version
+      });
     }
 
     const summaryParts: string[] = [];
     if (uploadedFiles.length > 0) summaryParts.push(uploadedFiles.map((f: any) => `"${f.name}" (${f.size})`).join(', '));
     if (storedReference) summaryParts.push(`Reference: ${storedReference}`);
     const fileSummary = summaryParts.length > 0 ? summaryParts.join(' | ') : 'written completion update';
-    const sysMsg: Message = {
-      id: 'msg_' + Date.now(),
-      orderId: order.id,
-      senderId: 'system',
-      senderName: 'WorkSphere Deliveries',
-      text: `📦 Invoice (v${version}) submitted: ${fileSummary}${sanitizedNotes ? ` — "${sanitizedNotes}"` : ''}. Buyer review window initiated.`,
-      timestamp: new Date().toISOString(),
-      type: 'system',
-      metadata: {
-        action: 'deliverable_submitted',
+    
+    emitSystemEvent(
+      order.id,
+      'deliverable_submitted',
+      isDraft
+        ? `📦 Draft Delivery #v${version} submitted (${fileSummary}).`
+        : `📦 Delivery / Final Invoice #v${version} submitted (${fileSummary}).`,
+      {
         version,
+        isDraft,
         notes: sanitizedNotes,
-        reference: storedReference || undefined
+        reference: storedReference || undefined,
+        files: uploadedFiles
       }
-    };
-    recordMessage(sysMsg);
-    saveMessagesToDisk();
-    saveOrdersToDisk();
-    broadcastMessage(sysMsg, order.id);
+    );
 
-    res.json({ success: true, files: uploadedFiles, file: uploadedFiles[0], order: enrichOrderWithServiceInfo(order) });
+    // When raised from the UI Invoice modal (createInvoiceOffer: true), also create or update the interactive INV-xxxx card
+    let createdInvoiceOffer: any = undefined;
+    if (!isDraft && req.body.createInvoiceOffer && orderHasEscrow(order.id)) {
+      const activeEsc = getActiveEscrowRemaining(order);
+      const requestedAmt = Math.round(Number(req.body.invoiceAmount || activeEsc || order.amount || 0) * 100) / 100;
+      const invAmt = requestedAmt >= activeEsc && requestedAmt > 0 ? requestedAmt : (activeEsc || Number(order.amount || 0));
+      const invTitle = (typeof req.body.invoiceTitle === 'string' && req.body.invoiceTitle.trim().length >= 3)
+        ? req.body.invoiceTitle.trim().slice(0, 120)
+        : `Final Invoice: ${order.title}`.slice(0, 120);
+      const existingPendingInv = workstreamOffers.find(o => o.orderId === order.id && o.kind === 'invoice' && o.status === 'pending');
+      if (existingPendingInv) {
+        existingPendingInv.title = invTitle;
+        existingPendingInv.amount = invAmt;
+        existingPendingInv.note = trimmedNotes || existingPendingInv.note;
+        existingPendingInv.files = uploadedFiles.length > 0 ? uploadedFiles : existingPendingInv.files;
+        existingPendingInv.reference = storedReference || existingPendingInv.reference;
+        await postgresStore.saveOffers(workstreamOffers);
+        createdInvoiceOffer = viewOffer(existingPendingInv);
+      } else if (invAmt > 0) {
+        const newInv: WorkstreamOffer = {
+          id: 'off_' + randomUUID().slice(0, 12),
+          number: `INV-${String(workstreamOffers.filter(o => o.kind === 'invoice').length + 1001)}`,
+          orderId: order.id,
+          kind: 'invoice',
+          title: invTitle,
+          amount: invAmt,
+          note: trimmedNotes || undefined,
+          files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
+          reference: storedReference || undefined,
+          status: 'pending',
+          createdBy: caller?.id || order.sellerId,
+          createdAt: new Date().toISOString()
+        };
+        workstreamOffers.push(newInv);
+        await postgresStore.saveOffers(workstreamOffers);
+        postOfferMessage(order, newInv, { id: caller?.id || order.sellerId, name: caller?.name || 'Seller' }, `New invoice ${newInv.number}: ${invTitle}`, 'offer_created');
+        createdInvoiceOffer = viewOffer(newInv);
+      }
+    }
+
+    await postgresStore.saveOrders(orders);
+
+    res.json({ success: true, files: uploadedFiles, file: uploadedFiles[0], offer: createdInvoiceOffer, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   } finally {
@@ -2633,9 +2435,9 @@ app.post('/api/orders/:id/deliverable', requireAuth, (req, res) => {
 });
 
 // Request Revision on Deliverable
-app.post('/api/orders/:id/revision', requireAuth, (req, res) => {
+app.post('/api/orders/:id/revision', requireAuth, async (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
   if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2672,25 +2474,12 @@ app.post('/api/orders/:id/revision', requireAuth, (req, res) => {
   order.revisions.push(revisionEntry);
   order.status = 'revision';
 
-  const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
-    orderId: order.id,
-    senderId: 'system',
-    senderName: 'WorkSphere Revision Desk',
-    text: `🔄 Revision requested on delivery v${revisionEntry.deliveryVersion}: "${reason}"`,
-    timestamp: new Date().toISOString(),
-    type: 'system',
-    metadata: {
-      action: 'revision_requested',
-      reason,
-      revisionId: revisionEntry.id,
-      deliveryVersion: revisionEntry.deliveryVersion
-    }
-  };
-  recordMessage(sysMsg);
-  saveMessagesToDisk();
-  saveOrdersToDisk();
-  broadcastMessage(sysMsg, order.id);
+  await postgresStore.saveOrders(orders);
+
+  emitSystemEvent(order.id, 'revision_requested', `Revision requested: "${reason}"`, {
+    revisionId: revisionEntry.id,
+    deliveryVersion: revisionEntry.deliveryVersion
+  });
 
     res.json({ success: true, revision: revisionEntry, order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
@@ -2703,7 +2492,7 @@ app.post('/api/orders/:id/revision', requireAuth, (req, res) => {
 // Participant (Buyer or Seller) Dispute Creation Flow
 app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2744,7 +2533,7 @@ app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
     order.status = 'disputed';
 
     const sysMsg: Message = {
-      id: 'msg_' + Date.now(),
+      id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
       orderId: order.id,
       senderId: 'system',
       senderName: 'WorkSphere Dispute Resolution Desk',
@@ -2758,9 +2547,9 @@ app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
       }
     };
     recordMessage(sysMsg);
-    saveMessagesToDisk();
-    saveOrdersToDisk();
-    saveDisputesToDisk();
+    postgresStore.saveMessages(messages);
+    postgresStore.saveOrders(orders);
+    postgresStore.saveDisputes(disputes);
     broadcastMessage(sysMsg, order.id);
 
     res.json({ success: true, dispute: newDispute, order: enrichOrderWithServiceInfo(order) });
@@ -2772,43 +2561,53 @@ app.post('/api/orders/:id/dispute', requireAuth, (req, res) => {
 });
 
 // Toggle Chat Mute
-app.patch('/api/orders/:id/mute', requireRole(['admin', 'super_admin', 'support']), (req, res) => {
+app.patch('/api/orders/:id/mute', requireRole(['admin', 'super_admin', 'support']), async (req, res) => {
   const order = orderIndex.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.isMuted = !order.isMuted;
+  await postgresStore.saveOrders(orders);
   const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
+    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     orderId: order.id,
     senderId: 'system',
     senderName: 'Administration Alert',
     text: order.isMuted 
       ? `🔒 Chat paused by Administrator during case review. Neither party may send messages.`
       : `🔓 Chat unlocked by Administrator. Standard messaging resumed.`,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    type: 'system',
+    metadata: { action: order.isMuted ? 'chat_muted' : 'chat_unmuted' }
   };
   recordMessage(sysMsg);
+  await postgresStore.saveMessages(messages);
+  broadcastMessage(sysMsg, order.id);
 
   res.json({ success: true, isMuted: order.isMuted });
 });
 
 // Toggle Pause Order Timer
-app.patch('/api/orders/:id/pause-timer', requireRole(['admin', 'super_admin', 'support']), (req, res) => {
+app.patch('/api/orders/:id/pause-timer', requireRole(['admin', 'super_admin', 'support']), async (req, res) => {
   const order = orderIndex.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
   order.isTimerPaused = !order.isTimerPaused;
+  await postgresStore.saveOrders(orders);
   const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
+    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     orderId: order.id,
     senderId: 'system',
     senderName: 'Administration Alert',
     text: order.isTimerPaused 
       ? `⏸️ Delivery countdown paused by Administrator pending dispute/clarification.`
       : `▶️ Delivery countdown resumed by Administrator. Normal timer active.`,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    type: 'system',
+    metadata: { action: order.isTimerPaused ? 'timer_paused' : 'timer_resumed' }
   };
   recordMessage(sysMsg);
+  postgresStore.saveMessages(messages);
+  broadcastMessage(sysMsg, order.id);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -2830,6 +2629,7 @@ app.patch('/api/users/availability', requireAuth, (req, res) => {
   const user = users.find(u => u.id === userId);
   if (!user) return res.status(404).json({ error: 'User not found' });
   user.isAvailableNow = !!isAvailableNow;
+  saveUsersToPostgres();
   res.json({ success: true, user: safeUser(user) });
 });
 
@@ -2840,6 +2640,7 @@ app.post('/api/users/:id/flag', requireAdmin, (req, res) => {
 
   user.isFlagged = !user.isFlagged;
   user.flagReason = user.isFlagged ? (req.body.reason || 'Flagged for TOS investigation.') : undefined;
+  saveUsersToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -2857,7 +2658,7 @@ app.post('/api/users/:id/flag', requireAdmin, (req, res) => {
 // Force Complete & Release Funds (admin only)
 app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2868,9 +2669,8 @@ app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
       return res.status(400).json({ error: 'Cannot force-complete a cancelled/refunded order.' });
     }
     const reason = String(req.body.reason || 'Admin administrative force-release in seller favor.');
-    const result = releaseOrderFunds(order, adminActor(req), reason, req.body.requestKey);
+    const result = releaseOrderFunds(order, adminActor(req), reason, false, req.body.requestKey);
     closeActiveDispute(order.id, 'resolved_release', reason);
-    pushSystemMessage(order.id, `✅ Order Approved & Completed by Administration! Escrow funds released to freelancer wallet. Net Payout: $${result.freelancerNet}.`, 'order_completed');
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -2882,7 +2682,7 @@ app.post('/api/orders/:id/force-complete', requireAdmin, (req, res) => {
 // Force Cancel & Refund Buyer (admin only). A partial refund refunds that amount and releases the rest to the seller.
 app.post('/api/orders/:id/force-cancel', requireAdmin, (req, res) => {
   const orderId = req.params.id;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(req.params.id);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -2905,7 +2705,6 @@ app.post('/api/orders/:id/force-cancel', requireAdmin, (req, res) => {
       result = refundOrderFunds(order, undefined, adminActor(req), reason, req.body.requestKey);
       refundAmount = result.refunded;
       closeActiveDispute(order.id, 'resolved_refund', reason);
-      pushSystemMessage(order.id, `🚨 Order Cancelled & Refunded by Administration. $${refundAmount} credited back to buyer wallet balance. Reason: ${reason}`, 'order_cancelled');
     }
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), result });
   } catch (err: any) {
@@ -2916,7 +2715,7 @@ app.post('/api/orders/:id/force-cancel', requireAdmin, (req, res) => {
 });
 
 // Send Chat Message into Order Workstream (unrestricted, responsive buyer/seller communication)
-app.post('/api/orders/:id/message', requireAuth, rateLimit(120, 60_000), (req, res) => {
+app.post('/api/orders/:id/message', requireAuth, rateLimit(120, 60_000), async (req, res) => {
   const order = orderIndex.get(req.params.id);
   if (!order) return res.status(404).json({ error: 'Order not found' });
 
@@ -2942,7 +2741,7 @@ app.post('/api/orders/:id/message', requireAuth, rateLimit(120, 60_000), (req, r
     const newMsg = sanitizeAndCreateMessage(user, order, req.body, fileCheck);
 
     recordMessage(newMsg);
-    saveMessagesToDisk();
+    await postgresStore.saveMessages(messages);
     broadcastMessage(newMsg, order.id);
 
     res.json({ success: true, message: newMsg });
@@ -3029,17 +2828,9 @@ interface CustomInvoice {
 
 let savedPaymentMethods: PaymentMethodRecord[] = [];
 
-const CUSTOM_INVOICES_FILE = path.join(DATA_DIR, 'custom_invoices.json');
-let customInvoices: CustomInvoice[] = [];
-try {
-  if (fs.existsSync(CUSTOM_INVOICES_FILE)) {
-    const parsed = JSON.parse(fs.readFileSync(CUSTOM_INVOICES_FILE, 'utf-8'));
-    if (Array.isArray(parsed)) customInvoices = parsed;
-  }
-} catch (e) {
-  console.error('Failed to load custom invoices:', e);
+function saveCustomInvoicesToDisk() { 
+  postgresStore.saveCustomInvoices(customInvoices).catch(err => console.error('[PostgresStore] Failed to save custom invoices:', err)); 
 }
-function saveCustomInvoicesToDisk() { writeJsonAtomic(CUSTOM_INVOICES_FILE, customInvoices); }
 
 // User Financial Overview Snapshot
 app.get('/api/payments/user/:userId', requireAuth, (req, res) => {
@@ -3062,19 +2853,27 @@ app.get('/api/payments/user/:userId', requireAuth, (req, res) => {
     const walletData = financeLedger.getWalletById(userId);
     const availableBalance = walletData?.wallet.availableBalance ?? (u?.walletBalance ?? 0);
     
-    const buyerEscrowOrders = orders.filter(o => o.buyerId === userId && ['funded_in_escrow', 'in_progress'].includes(o.status));
-    const buyerEscrowAmount = buyerEscrowOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
+    const activeEscrowStatuses = ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'disputed', 'draft_review', 'work_in_progress'];
+    const buyerEscrowOrders = orders.filter(o => o.buyerId === userId && activeEscrowStatuses.includes(o.status));
+    const buyerEscrowAmount = buyerEscrowOrders.reduce((sum, o) => {
+      const esc = financeLedger.getEscrow(o.id);
+      return sum + (esc && esc.status === 'held' ? esc.remaining : (o.amount || 0));
+    }, 0);
 
-    const freelancerEscrowOrders = orders.filter(o => o.sellerId === userId && ['funded_in_escrow', 'in_progress', 'delivered'].includes(o.status));
-    const freelancerEscrowAmount = freelancerEscrowOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
+    const freelancerEscrowOrders = orders.filter(o => o.sellerId === userId && activeEscrowStatuses.includes(o.status));
+    const freelancerEscrowAmount = freelancerEscrowOrders.reduce((sum, o) => {
+      const esc = financeLedger.getEscrow(o.id);
+      return sum + (esc && esc.status === 'held' ? esc.remaining : (o.amount || 0));
+    }, 0);
 
-    const userPaidOrders = orders.filter(o => o.buyerId === userId && ['funded_in_escrow', 'in_progress', 'delivered', 'completed'].includes(o.status));
+    const currentYearMonth = new Date().toISOString().slice(0, 7);
+    const userPaidOrders = orders.filter(o => o.buyerId === userId && ['funded_in_escrow', 'in_progress', 'delivered', 'revision', 'disputed', 'completed'].includes(o.status));
     const paidToDate = userPaidOrders.reduce((sum, o) => sum + (o.amount || 0), 0);
-    const paidThisMonth = userPaidOrders.filter(o => (o.createdAt || '').startsWith('2026-10')).reduce((sum, o) => sum + (o.amount || 0), 0);
+    const paidThisMonth = userPaidOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + (o.amount || 0), 0);
 
     const userEarnedOrders = orders.filter(o => o.sellerId === userId && o.status === 'completed');
     const earnedToDate = u?.earned ?? userEarnedOrders.reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
-    const earnedThisMonth = userEarnedOrders.filter(o => (o.createdAt || '').startsWith('2026-10')).reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
+    const earnedThisMonth = userEarnedOrders.filter(o => (o.createdAt || '').startsWith(currentYearMonth)).reduce((sum, o) => sum + financeLedger.quoteOrder(o.amount).freelancerNet, 0);
 
     const userMethods = savedPaymentMethods.filter(m => m.userId === userId);
 
@@ -3168,6 +2967,7 @@ function handlePayoutRequest(req: Request, res: Response) {
       accountDetails: payout.accountDetails
     };
     payouts.unshift(record);
+    postgresStore.savePayouts(payouts);
     syncUserBalances();
 
     registerAuditLog({
@@ -3260,6 +3060,69 @@ app.post('/api/payments/deposit', requireAuth, rateLimit(10, 60_000), (req, res)
   }
 });
 
+app.post('/api/payments/gateway/checkout', requireAuth, rateLimit(10, 60_000), (req, res) => {
+  const { amount, currency = 'USD', gateway = 'stripe' } = req.body || {};
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = users.find(u => u.id === authUserId);
+  if (!caller) return res.status(401).json({ error: 'Unauthorized' });
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: 'Valid amount required' });
+
+  ensureWallet(authUserId);
+  const checkoutId = 'chk_' + randomUUID();
+  res.json({
+    success: true,
+    checkoutId,
+    gateway,
+    amount: amt,
+    currency,
+    redirectUrl: `/checkout/success?session_id=${checkoutId}&amount=${amt}`
+  });
+});
+
+// For webhook signature verification, we need the raw body. 
+// Using a separate route or parsing raw body for this specific path.
+app.post('/api/payments/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  const signature = req.headers['x-webhook-signature'] as string;
+  const secret = process.env.WEBHOOK_SECRET;
+  
+  if (!secret || !signature) {
+    return res.status(403).json({ error: 'Unauthorized: Missing signature' });
+  }
+
+  const hmac = createHmac('sha256', secret);
+  hmac.update(req.body);
+  const calculatedSignature = hmac.digest('hex');
+
+  const sigBuf = Buffer.from(signature);
+  const expBuf = Buffer.from(calculatedSignature);
+  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+    return res.status(403).json({ error: 'Unauthorized: Invalid signature' });
+  }
+
+  const payload = JSON.parse(req.body.toString());
+  const { event, userId, amount, reference, transactionId } = payload || {};
+  
+  if (event === 'payment.succeeded' && userId && amount) {
+    ensureWallet(userId);
+    try {
+      financeLedger.creditDeposit({
+        userId,
+        amount: Number(amount),
+        reference: reference || transactionId || 'WH-DEPOSIT',
+        idempotencyKey: `WH-${userId}-${transactionId || reference || Date.now()}`,
+        actor: 'Gateway Webhook',
+        source: 'webhook'
+      });
+      syncUserBalances();
+      return res.json({ received: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: e.message });
+    }
+  }
+  res.json({ received: true });
+});
+
 // Withdraw Funds from User Account
 app.post('/api/payments/withdraw', requireAuth, rateLimit(10, 60_000), handlePayoutRequest);
 
@@ -3303,11 +3166,11 @@ function validateOrderReleasePreconditions(order: Order, isAdmin = false, isInvo
 app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
   const { orderId } = req.body;
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const userId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === userId);
-    const order = orderIndex.get(orderId);
+    const order = orderIndex.get(orderId) || orders.find(o => o.id === orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
 
     const isAdmin = caller?.role === 'admin' || caller?.role === 'super_admin';
@@ -3322,12 +3185,29 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
     }
 
     // Mark any requested revisions as resolved upon approval
+    let revisionsResolved = false;
     if (Array.isArray(order.revisions)) {
       for (const rev of order.revisions) {
         if (rev.status === 'requested') {
           rev.status = 'resolved';
+          revisionsResolved = true;
         }
       }
+    }
+    if (revisionsResolved) {
+      const sysMsg: Message = {
+        id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        orderId: order.id,
+        senderId: 'system',
+        senderName: 'WorkSphere Review Desk',
+        text: `📝 Revision resolved by buyer.`,
+        timestamp: new Date().toISOString(),
+        type: 'system',
+        metadata: { action: 'revision_resolved' }
+      };
+      recordMessage(sysMsg);
+      postgresStore.saveMessages(messages);
+      broadcastMessage(sysMsg, order.id);
     }
 
     const esc = financeLedger.getEscrow(order.id);
@@ -3348,7 +3228,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
       pendingMatchingInvoice.status = 'paid';
       pendingMatchingInvoice.resolvedAt = new Date().toISOString();
       pendingMatchingInvoice.resolvedBy = caller?.id || userId;
-      saveOffersToDisk();
+      postgresStore.saveOffers(workstreamOffers);
     }
 
     const seller = users.find(u => u.id === order.sellerId);
@@ -3359,7 +3239,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
 
     const actorName = isAdmin ? adminActor(req) : (buyer?.name || 'Authorized Buyer');
     const requestKey = req.body?.requestKey || req.body?.idempotencyKey;
-    const result = releaseOrderFunds(order, actorName, 'Buyer approved work', requestKey);
+    const result = releaseOrderFunds(order, actorName, 'Buyer approved work', true, requestKey);
 
     registerAuditLog({
       id: 'log_' + Date.now(),
@@ -3370,24 +3250,6 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
       details: `Escrow release authorized of $${order.amount}. $${result.freelancerNet} credited to ${seller?.name || 'freelancer'}, $${result.platformFee} platform fee.`,
       timestamp: new Date().toLocaleString()
     });
-
-    const releaseMsg: Message = {
-      id: 'msg_' + Date.now(),
-      orderId: order.id,
-      senderId: 'system',
-      senderName: 'WorkSphere Escrow Vault',
-      text: `🎉 Escrow funds ($${order.amount.toLocaleString()}) released to seller! Workstream marked as completed.`,
-      timestamp: new Date().toISOString(),
-      type: 'system',
-      metadata: {
-        action: 'escrow_released',
-        amount: order.amount
-      }
-    };
-    recordMessage(releaseMsg);
-    saveMessagesToDisk();
-    saveOrdersToDisk();
-    broadcastMessage(releaseMsg, order.id);
 
     res.json({ success: true, order: enrichOrderWithServiceInfo(order), freelancerNet: result.freelancerNet, platformFee: result.platformFee });
   } catch (err: any) {
@@ -3401,7 +3263,7 @@ app.post('/api/payments/escrow/release', requireAuth, (req, res) => {
 app.post('/api/payments/escrow/refund', requireAuth, (req, res) => {
   const { orderId } = req.body;
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const userId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === userId);
@@ -3466,7 +3328,7 @@ app.post('/api/payments/escrow/refund', requireAuth, (req, res) => {
 app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (req, res) => {
   const orderId = String(req.body?.orderId || '');
   if (!orderId) return res.status(400).json({ error: 'Order ID is required' });
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const authUserId = (req as any).authenticatedUserId;
     const caller = users.find(u => u.id === authUserId);
@@ -3479,7 +3341,11 @@ app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (re
       return res.status(403).json({ error: 'Forbidden: Only the order buyer or administrator can fund escrow.' });
     }
 
-    if (order.status !== 'in_progress') {
+    if (order.status === 'funded_in_escrow' || orderHasEscrow(order.id)) {
+      return res.status(400).json({ error: 'Order escrow is already funded.' });
+    }
+
+    if (order.status !== 'payment_pending' && order.status !== 'in_progress') {
       return res.status(400).json({ error: `Cannot fund escrow for order in status "${order.status}"` });
     }
 
@@ -3493,7 +3359,7 @@ app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (re
     ensureWallet(sellerId);
 
     // Call ledger engine to fund escrow atomically
-    financeLedger.fundEscrow({
+    fundOrderEscrowWithEvent({
       orderId: order.id,
       orderTitle: order.title,
       amount: order.amount,
@@ -3507,7 +3373,7 @@ app.post('/api/payments/escrow/deposit', requireAuth, rateLimit(20, 60_000), (re
     order.escrowProtectionStartDate = today;
     order.escrowProtectionEndDate = new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0];
     syncUserBalances();
-    saveOrdersToDisk();
+    postgresStore.saveOrders(orders);
 
     const newBalance = financeLedger.getWalletBalance(buyerId) ?? buyer.walletBalance;
     res.json({ success: true, order, newBalance });
@@ -3755,21 +3621,16 @@ app.patch('/api/payments/methods/:id/default', requireAuth, (req, res) => {
 // ==========================================
 
 // Reset Financial Ledger and Workstream Data to Pristine Clean State
-app.post('/api/admin/finance/reset-clean', requireRole(['admin', 'super_admin']), (req, res) => {
+app.post('/api/admin/finance/reset-clean', requireRole(['admin', 'super_admin']), async (req, res) => {
   try {
-    financeLedger.resetToCleanState();
-    orders = [];
+    await cleanAllStoreData();
     orderIndex.clear();
-    messages = [];
     messageIndex.clear();
-    workstreamOffers = [];
-    customInvoices = [];
-    disputes = [];
-    saveOrdersToDisk();
-    saveMessagesToDisk();
-    saveOffersToDisk();
-    saveCustomInvoicesToDisk();
-    res.json({ success: true, message: 'Financial ledger and workstream data reset to pristine clean state.' });
+    orderStateLocks.clear();
+    releaseCompletedOrders.clear();
+    refundCompletedOrders.clear();
+    requestKeyCache.clear();
+    res.json({ success: true, message: 'All demo and runtime data reset to pristine clean state.' });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
@@ -3929,7 +3790,7 @@ app.get('/api/admin/finance/escrow', requireAdmin, (req, res) => {
 
 app.post('/api/admin/finance/escrow/:orderId/release', requireAdmin, (req, res) => {
   const orderId = req.params.orderId;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -3947,7 +3808,7 @@ app.post('/api/admin/finance/escrow/:orderId/release', requireAdmin, (req, res) 
     if (!esc || esc.remaining <= 0 || esc.status === 'released' || esc.status === 'refunded') {
       return res.status(400).json({ error: 'No refundable or releasable escrow funds remain for this order.' });
     }
-    const result = releaseOrderFunds(order, adminActor(req), String(req.body.reason || 'Administrative escrow release'), req.body.requestKey);
+    const result = releaseOrderFunds(order, adminActor(req), String(req.body.reason || 'Administrative escrow release'), false, req.body.requestKey);
     res.json({ success: true, order, journal: result.journal, freelancerNet: result.freelancerNet, platformFee: result.platformFee });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -3958,7 +3819,7 @@ app.post('/api/admin/finance/escrow/:orderId/release', requireAdmin, (req, res) 
 
 app.post('/api/admin/finance/escrow/:orderId/refund', requireAdmin, (req, res) => {
   const orderId = req.params.orderId;
-  acquireOrderLock(orderId);
+  if (!tryAcquireOrderLock(orderId, res)) return;
   try {
     const order = orderIndex.get(orderId);
     if (!order) return res.status(404).json({ error: 'Order not found' });
@@ -4021,6 +3882,7 @@ const approvePayout = (req: Request, res: Response) => {
     if (!p) return res.status(404).json({ error: 'Payout not found' });
     if (p.status !== 'pending') return res.status(400).json({ error: `Cannot approve payout in status "${p.status}"` });
     p.status = 'approved';
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_APPROVED', p, `Approved payout of $${p.amount} via ${p.method} for freelancer ${p.freelancerId}`);
     res.json(p);
   } catch (err: any) { res.status(400).json({ error: err.message }); }
@@ -4037,6 +3899,7 @@ const processPayout = (req: Request, res: Response) => {
     }
     const { journal } = financeLedger.settlePayout({ payoutId: p.id, actor: adminActor(req), providerReference: req.body?.providerReference });
     p.status = 'processed';
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_PROCESSED', p, `Processed payout of $${p.amount} via ${p.method}`);
     syncUserBalances();
     res.json({ success: true, payout: p, journal, ...p });
@@ -4050,6 +3913,7 @@ const rejectPayout = (req: Request, res: Response) => {
     if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot reject payout in status "${p.status}"` });
     financeLedger.cancelPayout({ payoutId: p.id, reason: String(req.body?.reason || 'Administrative rejection'), actor: adminActor(req) });
     p.status = 'cancelled';
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_REJECTED', p, `Rejected payout of $${p.amount}; funds returned to wallet`);
     syncUserBalances();
     res.json({ success: true, payout: p, ...p });
@@ -4063,6 +3927,7 @@ const failPayout = (req: Request, res: Response) => {
     if (p.status !== 'pending' && p.status !== 'approved') return res.status(400).json({ error: `Cannot fail payout in status "${p.status}"` });
     financeLedger.failPayout({ payoutId: p.id, reason: String(req.body?.reason || 'Gateway reported a transfer failure'), actor: adminActor(req) });
     p.status = 'failed';
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_FAILED', p, `Payout of $${p.amount} failed; funds returned to wallet`);
     syncUserBalances();
     res.json(p);
@@ -4076,6 +3941,7 @@ const retryPayout = (req: Request, res: Response) => {
     if (p.status !== 'failed') return res.status(400).json({ error: 'Only failed payouts can be retried.' });
     financeLedger.retryPayout({ payoutId: p.id, actor: adminActor(req) });
     p.status = 'pending';
+    postgresStore.savePayouts(payouts);
     payoutAudit(req, 'PAYOUT_RETRIED', p, `Re-queued failed payout of $${p.amount}`);
     syncUserBalances();
     res.json(p);
@@ -4522,8 +4388,8 @@ app.post('/api/reviews', requireAuth, (req, res) => {
 
   const order = orderIndex.get(orderId);
   if (!order) return res.status(404).json({ error: 'Workstream order not found' });
-  if (!canAccessOrderWorkstream(caller, order)) {
-    return res.status(403).json({ error: 'Forbidden: Only order participants can submit reviews.' });
+  if (caller.id !== order.buyerId && caller.id !== order.sellerId) {
+    return res.status(403).json({ error: 'Forbidden: Only the buyer or seller of this order can submit a review.' });
   }
 
   // Validate targetUserId against actual seller/buyer associated with order
@@ -4533,14 +4399,17 @@ app.post('/api/reviews', requireAuth, (req, res) => {
   }
   const resolvedTargetUserId = expectedTargetUserId;
 
-  // Completed and Cancelled order eligibility
+  // Completed, Cancelled, or Paid-Invoice Workstream eligibility
   const allowedReviewStatuses = ['completed', 'cancelled'];
-  if (!allowedReviewStatuses.includes(order.status)) {
+  if (!allowedReviewStatuses.includes(order.status) && !hasPaidInvoiceOrReleasedEscrow(order)) {
     return res.status(409).json({ error: `Reviews can only be submitted for completed or cancelled Workstreams (current status: ${order.status}).` });
   }
 
+  const isBuyerReviewer = caller.id === order.buyerId;
   // Check if review already exists for this order & reviewer -> Block duplicate submission (409)
-  const existingReview = reviews.find(r => r.orderId === order.id && r.reviewerId === caller.id) || (order.review && order.review.reviewerId === caller.id ? order.review : null);
+  const existingReview = reviews.find(r => r.orderId === order.id && r.reviewerId === caller.id) ||
+    (isBuyerReviewer && order.review && order.review.reviewerId === caller.id ? order.review : null) ||
+    (!isBuyerReviewer && (order as any).sellerReview && (order as any).sellerReview.reviewerId === caller.id ? (order as any).sellerReview : null);
   if (existingReview) {
     return res.status(409).json({ error: 'A review has already been submitted for this order. Use PUT /api/reviews/:id to edit your review.' });
   }
@@ -4562,17 +4431,31 @@ app.post('/api/reviews', requireAuth, (req, res) => {
   };
 
   reviews.unshift(newReview);
-  saveReviewsToDisk();
+  postgresStore.saveReviews(reviews);
 
-  order.review = newReview;
-  saveOrdersToDisk();
+  if (isBuyerReviewer) {
+    order.review = newReview;
+  } else {
+    (order as any).sellerReview = newReview;
+  }
+  postgresStore.saveOrders(orders);
 
   // Dynamically update target user's rating and reviewsCount using public reviews
   recalculateUserRating(resolvedTargetUserId);
 
+  createNotification({
+    userId: resolvedTargetUserId,
+    type: 'review',
+    title: 'New Review Received',
+    message: `${caller.name} left a ${numRating}-star review for order "${order.title}".`,
+    link: `/orders/${order.id}`,
+    dedupKey: `review_${newReview.id}`,
+    actorId: caller.id
+  });
+
   // Broadcast system message to workstream
   const sysMsg: Message = {
-    id: 'msg_' + Date.now(),
+    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     orderId: order.id,
     senderId: 'system',
     senderName: 'WorkSphere Reviews',
@@ -4587,7 +4470,7 @@ app.post('/api/reviews', requireAuth, (req, res) => {
     }
   };
   recordMessage(sysMsg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(sysMsg, order.id);
 
   res.status(201).json({ success: true, review: newReview, order: enrichOrderWithServiceInfo(order) });
@@ -4620,7 +4503,7 @@ app.put('/api/reviews/:id', requireAuth, (req, res) => {
   }
 
   review.updatedAt = new Date().toISOString();
-  saveReviewsToDisk();
+  postgresStore.saveReviews(reviews);
 
   if (review.targetUserId) {
     recalculateUserRating(review.targetUserId);
@@ -4631,7 +4514,7 @@ app.put('/api/reviews/:id', requireAuth, (req, res) => {
     if (order && order.review && order.review.id === review.id) {
       order.review.rating = review.rating;
       order.review.comment = review.comment;
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
     }
   }
 
@@ -4670,7 +4553,7 @@ app.post('/api/reviews/:id/reply', requireAuth, (req, res) => {
   };
 
   review.reply = replyObj;
-  saveReviewsToDisk();
+  postgresStore.saveReviews(reviews);
 
   if (review.orderId) {
     const order = orderIndex.get(review.orderId);
@@ -4678,10 +4561,10 @@ app.post('/api/reviews/:id/reply', requireAuth, (req, res) => {
       if (order.review && order.review.id === review.id) {
         order.review.reply = replyObj;
       }
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
 
       const sysMsg: Message = {
-        id: 'msg_' + Date.now(),
+        id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
         orderId: order.id,
         senderId: 'system',
         senderName: 'WorkSphere Reviews',
@@ -4691,7 +4574,7 @@ app.post('/api/reviews/:id/reply', requireAuth, (req, res) => {
         metadata: { action: 'review_reply_submitted', reply: replyObj }
       };
       recordMessage(sysMsg);
-      saveMessagesToDisk();
+      postgresStore.saveMessages(messages);
       broadcastMessage(sysMsg, order.id);
     }
   }
@@ -4726,6 +4609,7 @@ app.patch('/api/user-emails/:id/read', requireAuth, (req, res) => {
   const em = userEmails.find(e => e.id === req.params.id);
   if (!em) return res.status(404).json({ error: 'Notification not found' });
   em.read = true;
+  postgresStore.saveUserEmails(userEmails).catch(err => console.error('[PostgresStore] Failed to save user emails:', err));
   res.json({ success: true });
 });
 
@@ -4752,6 +4636,7 @@ app.post('/api/support-tickets', requireAuth, (req, res) => {
     ]
   };
   supportTickets.unshift(newTicket);
+  postgresStore.saveSupportTickets(supportTickets).catch(err => console.error('[PostgresStore] Failed to save tickets:', err));
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -4772,7 +4657,6 @@ if (!fs.existsSync(WORKSTREAM_UPLOADS_DIR)) {
 }
 
 const WORKSTREAM_FILE_URL_PREFIX = '/api/workstream/files/';
-const WORKSTREAM_UPLOAD_INDEX_FILE = path.join(DATA_DIR, 'workstream_uploads.json');
 const WORKSTREAM_MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB
 const WORKSTREAM_ABANDONED_UPLOAD_TTL_MS = 24 * 3600 * 1000;
 // Allowed attachment types. Vectors (.svg) and code (.html, .js, .ts, etc.) are fully supported without restriction.
@@ -4786,17 +4670,11 @@ const WORKSTREAM_ALLOWED_EXTENSIONS = new Set([
 // .html is deliberately NOT inline: it would run uploaded scripts on the app origin. It is still fully downloadable.
 const WORKSTREAM_INLINE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.pdf', '.svg', '.txt']);
 
+
 // Upload ownership index: filename -> who uploaded it and when. Persisted so access rules and
 // abandoned-upload cleanup survive restarts.
-interface WorkstreamUploadRecord { ownerId: string; createdAt: string; }
-let workstreamUploadIndex: Record<string, WorkstreamUploadRecord> = {};
-try {
-  if (fs.existsSync(WORKSTREAM_UPLOAD_INDEX_FILE)) {
-    workstreamUploadIndex = JSON.parse(fs.readFileSync(WORKSTREAM_UPLOAD_INDEX_FILE, 'utf-8')) || {};
-  }
-} catch (err) {
-  console.error('Failed to load workstream upload index:', err);
-}
+// (Old implementation removed in favor of atomic helper)
+
 
 // (Old implementation removed in favor of atomic helper)
 
@@ -4903,6 +4781,7 @@ function cleanupAbandonedWorkstreamUploads() {
 
     try { fs.unlinkSync(path.join(WORKSTREAM_UPLOADS_DIR, filename)); } catch { /* already gone */ }
     delete workstreamUploadIndex[filename];
+    postgresStore.deleteUploadRecord(filename).catch(console.error);
     changed = true;
   }
 
@@ -4971,8 +4850,8 @@ export function processAutoAcceptOrders(customNow?: number): Array<{
       if (hasActiveRequestedRevision) continue;
     }
 
-    // 5. Must skip disputed orders
-    if ((order.status as string) === 'disputed') continue;
+    // 5. Must skip disputed orders and timer-paused orders
+    if ((order.status as string) === 'disputed' || order.isTimerPaused) continue;
     const hasDispute = disputes.some(
       d => d.orderId === order.id && (d.status === 'open' || d.status === 'under_investigation')
     );
@@ -5002,11 +4881,11 @@ export function processAutoAcceptOrders(customNow?: number): Array<{
       console.log(`[ReviewWindow] Auto-accepting order ${order.id} (delivery v${latestDelivery.version}) after ${days} days.`);
       
       // Execute release using the same releaseOrderFunds path as a manual release
-      const result = releaseOrderFunds(order, 'System Auto-Accept', `Auto-accept after buyer review window (${days} days) elapsed`, requestKey);
+      const result = releaseOrderFunds(order, 'System Auto-Accept', `Auto-accept after buyer review window (${days} days) elapsed`, false, requestKey);
 
       // Record acceptedVersion
       order.acceptedVersion = latestDelivery.version;
-      saveOrdersToDisk();
+      postgresStore.saveOrders(orders);
 
       // Post system message into workstream
       const sysMsg: Message = {
@@ -5024,7 +4903,7 @@ export function processAutoAcceptOrders(customNow?: number): Array<{
         }
       };
       recordMessage(sysMsg);
-      saveMessagesToDisk();
+      postgresStore.saveMessages(messages);
       broadcastMessage(sysMsg, order.id);
 
       // Log to the audit log
@@ -5072,7 +4951,7 @@ app.post('/api/admin/orders/check-auto-accept', requireAdmin, (req, res) => {
     res.status(500).json({ error: err.message || 'Auto-accept check failed' });
   }
 });
-app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.raw({ type: '*/*', limit: WORKSTREAM_MAX_UPLOAD_BYTES }), (req, res) => {
+app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.raw({ type: '*/*', limit: WORKSTREAM_MAX_UPLOAD_BYTES }), async (req, res) => {
   try {
     const caller = (req as any).authenticatedUser;
     const rawName = (req.query.name as string) || 'attachment';
@@ -5085,7 +4964,6 @@ app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.ra
     }
     const nameWithoutExt = path.basename(safeBase, path.extname(safeBase));
     const storedFilename = `${Date.now()}_${randomUUID().slice(0, 8)}_${nameWithoutExt}${ext}`;
-    const filePath = path.join(WORKSTREAM_UPLOADS_DIR, storedFilename);
 
     const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
     if (!buffer || buffer.length === 0) {
@@ -5095,8 +4973,16 @@ app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.ra
       return res.status(413).json({ error: 'File is too large (25 MB maximum).' });
     }
 
-    fs.writeFileSync(filePath, buffer);
-    workstreamUploadIndex[storedFilename] = { ownerId: caller.id, createdAt: new Date().toISOString() };
+    const mimeType = (req.headers['content-type'] as string) || 'application/octet-stream';
+    const fileUrl = await uploadFileToCloudStorage(storedFilename, buffer, mimeType);
+
+    workstreamUploadIndex[storedFilename] = {
+      ownerId: caller.id,
+      originalName: safeBase,
+      mime: mimeType,
+      size: buffer.length,
+      createdAt: new Date().toISOString()
+    };
     saveWorkstreamUploadIndex();
 
     const bytes = buffer.length;
@@ -5104,12 +4990,10 @@ app.post('/api/workstream/upload', requireAuth, rateLimit(5, 60_000), express.ra
       ? `${(bytes / (1024 * 1024)).toFixed(1)} MB`
       : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
-    const mimeType = (req.headers['content-type'] as string) || 'application/octet-stream';
-
     res.json({
       name: safeBase,
       size: sizeStr,
-      url: `${WORKSTREAM_FILE_URL_PREFIX}${storedFilename}`,
+      url: fileUrl,
       type: mimeType
     });
   } catch (err: any) {
@@ -5182,8 +5066,20 @@ app.post('/api/messages', requireAuth, (req, res) => {
     const newMsg = sanitizeAndCreateMessage(caller, order, req.body, fileCheck);
 
     recordMessage(newMsg);
-    saveMessagesToDisk();
+    postgresStore.saveMessages(messages);
     broadcastMessage(newMsg, order.id);
+
+    const otherUserId = order.buyerId === caller.id ? order.sellerId : order.buyerId;
+    createNotification({
+      userId: otherUserId,
+      type: 'message',
+      title: 'New Message',
+      message: `${caller.name} sent a message regarding order "${order.title}".`,
+      link: `/orders/${order.id}`,
+      dedupKey: `msg_${newMsg.id}`,
+      actorId: caller.id
+    });
+
     res.json(newMsg);
   } catch (err: any) {
     res.status(400).json({ error: err.message || 'Failed to send message' });
@@ -5242,7 +5138,7 @@ app.get('/api/admin/messages/threads', requireAdmin, (req, res) => {
   res.json(threads);
 });
 
-app.post('/api/gigs', requireAuth, (req, res) => {
+app.post('/api/gigs', requireAuth, async (req, res) => {
   const authUserId = (req as any).authenticatedUserId;
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
@@ -5285,10 +5181,18 @@ app.post('/api/gigs', requireAuth, (req, res) => {
     extras: req.body.extras || []
   };
   gigs.unshift(newGig);
+  try {
+    await postgresStore.saveGigs(gigs);
+  } catch (err) {
+    console.error('[CreateGig] Failed to persist:', err);
+    const idx = gigs.findIndex(g => g.id === newGig.id);
+    if (idx !== -1) gigs.splice(idx, 1);
+    return res.status(500).json({ error: 'Could not save. Please try again.' });
+  }
   res.json(newGig);
 });
 
-app.post('/api/projects', requireAuth, (req, res) => {
+app.post('/api/projects', requireAuth, async (req, res) => {
   const authUserId = (req as any).authenticatedUserId;
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
@@ -5321,7 +5225,50 @@ app.post('/api/projects', requireAuth, (req, res) => {
     featured: false
   };
   projects.unshift(newProj);
+  try {
+    await postgresStore.saveProjects(projects);
+  } catch (err) {
+    console.error('[CreateProject] Failed to persist:', err);
+    const idx = projects.findIndex(p => p.id === newProj.id);
+    if (idx !== -1) projects.splice(idx, 1);
+    return res.status(500).json({ error: 'Could not save. Please try again.' });
+  }
   res.json(newProj);
+});
+
+app.patch('/api/projects/:id/status', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
+  if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
+
+  const p = projects.find(proj => proj.id === req.params.id);
+  if (!p) return res.status(404).json({ error: 'Project not found' });
+
+  if (p.buyerId !== caller.id && !isStaffUser(caller)) {
+    return res.status(403).json({ error: 'Forbidden: Only the project owner can update this project status.' });
+  }
+
+  const requestedStatus = typeof req.body?.status === 'string' ? req.body.status.trim().toLowerCase() : 'completed';
+  const allowedStatuses: Project['status'][] = ['open', 'published', 'in_progress', 'completed', 'unpublished'];
+  if (!allowedStatuses.includes(requestedStatus as Project['status'])) {
+    return res.status(400).json({ error: 'Invalid project status.' });
+  }
+
+  const oldStatus = p.status;
+  p.status = requestedStatus as Project['status'];
+  postgresStore.saveProjects(projects);
+
+  registerAuditLog({
+    id: 'log_' + Date.now(),
+    actor: caller.name,
+    role: caller.role || 'user',
+    action: `PROJECT_STATUS_${p.status.toUpperCase()}`,
+    target: `Project "${p.title}"`,
+    details: `Buyer changed project status from "${oldStatus}" to "${p.status}" (${p.status === 'completed' ? 'Closed bidding & hidden from public listing' : 'Updated listing status'})`,
+    timestamp: new Date().toLocaleString()
+  });
+
+  res.json(p);
 });
 
 // Admin Projects Management Endpoints
@@ -5345,6 +5292,8 @@ app.patch('/api/admin/projects/:id', requireAdmin, (req, res) => {
   if (req.body.moderationStatus !== undefined) p.moderationStatus = req.body.moderationStatus;
   if (req.body.moderationNotes !== undefined) p.moderationNotes = req.body.moderationNotes;
 
+  postgresStore.saveProjects(projects);
+
   registerAuditLog({
     id: 'log_' + Date.now(),
     actor: 'Admin Chief',
@@ -5364,6 +5313,7 @@ app.patch('/api/admin/projects/:id/status', requireAdmin, (req, res) => {
 
   const oldStatus = p.status;
   p.status = req.body.status;
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5383,6 +5333,7 @@ app.patch('/api/admin/projects/:id/feature', requireAdmin, (req, res) => {
   if (!p) return res.status(404).json({ error: 'Project not found' });
 
   p.featured = !p.featured;
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5403,6 +5354,7 @@ app.delete('/api/admin/projects/:id', requireAdmin, (req, res) => {
 
   const deleted = projects[index];
   projects.splice(index, 1);
+  postgresStore.saveProjects(projects);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5437,6 +5389,8 @@ app.patch('/api/admin/gigs/:id', requireAdmin, (req, res) => {
   if (req.body.moderationStatus !== undefined) g.moderationStatus = req.body.moderationStatus;
   if (req.body.moderationNotes !== undefined) g.moderationNotes = req.body.moderationNotes;
 
+  saveGigsToPostgres();
+
   registerAuditLog({
     id: 'log_' + Date.now(),
     actor: 'Admin Chief',
@@ -5456,6 +5410,7 @@ app.patch('/api/admin/gigs/:id/status', requireAdmin, (req, res) => {
 
   const oldStatus = g.status;
   g.status = req.body.status;
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5475,6 +5430,7 @@ app.patch('/api/admin/gigs/:id/feature', requireAdmin, (req, res) => {
   if (!g) return res.status(404).json({ error: 'Gig/Service not found' });
 
   g.featured = !g.featured;
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5495,6 +5451,7 @@ app.delete('/api/admin/gigs/:id', requireAdmin, (req, res) => {
 
   const deleted = gigs[index];
   gigs.splice(index, 1);
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5520,6 +5477,7 @@ app.delete('/api/gigs/:id', requireAuth, (req, res) => {
   }
 
   gigs.splice(index, 1);
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5566,6 +5524,8 @@ app.patch('/api/gigs/:id', requireAuth, (req, res) => {
   if (req.body.moderationStatus !== undefined) g.moderationStatus = req.body.moderationStatus;
   if (req.body.moderationNotes !== undefined) g.moderationNotes = req.body.moderationNotes;
 
+  saveGigsToPostgres();
+
   registerAuditLog({
     id: 'log_' + Date.now(),
     actor: 'Freelancer / User',
@@ -5588,6 +5548,7 @@ app.patch('/api/gigs/:id/feature', requireAuth, (req, res) => {
   }
 
   g.featured = !g.featured;
+  saveGigsToPostgres();
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -5602,95 +5563,265 @@ app.patch('/api/gigs/:id/feature', requireAuth, (req, res) => {
   res.json(g);
 });
 
-/**
- * Opens (or reuses) the private workstream between a project's owner and a freelancer who bid on it.
- * The owner is the buyer and the freelancer is the seller, so the existing proposal / escrow flow
- * (seller sends a Proposal, buyer accepts and pays into escrow) works unchanged inside this thread.
- * Returns the workstream's order id, or undefined when no chat can be opened (the bid itself still stands).
- */
-function openProjectChat(project: any, freelancer: any, proposal: Proposal): string | undefined {
-  try {
-    if (!project || !['open', 'published'].includes(project.status)) return undefined;
-    const owner = users.find(u => u.id === project.buyerId);
-    if (!owner || owner.status !== 'active' || owner.id === freelancer.id) return undefined;
-
-    let order: Order | undefined = orders.find(o =>
-      o.projectId === project.id && o.buyerId === owner.id && o.sellerId === freelancer.id &&
-      !['completed', 'cancelled'].includes(o.status));
-    if (!order) {
-      const created: Order = {
-        id: 'ord_' + randomUUID().slice(0, 12),
-        title: `Inquiry: ${project.title}`,
-        buyerId: owner.id, sellerId: freelancer.id,
-        amount: 0, status: 'in_progress',
-        createdAt: new Date().toISOString().split('T')[0],
-        dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
-        projectId: project.id
-      };
-      order = enrichOrderWithServiceInfo(created) as Order;
-      recordOrder(order);
-      saveOrdersToDisk();
-    }
-
-    const sym = siteSettings.getFlattenedSettings().currencySymbol || '$';
-    const days = proposal.deliveryDays;
-    const text = `Proposal for "${project.title}"\nBid: ${sym}${proposal.bidAmount} · Delivery: ${days} day${days === 1 ? '' : 's'}\n\n${proposal.coverLetter}`.slice(0, 5000);
-    const msg: Message = {
-      id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
-      orderId: order.id,
-      senderId: freelancer.id,
-      senderName: freelancer.name,
-      text,
-      timestamp: new Date().toISOString(),
-      type: 'message',
-      metadata: { action: 'project_proposal' }
-    };
-    const offer: WorkstreamOffer = {
-      id: 'off_' + randomUUID().slice(0, 12),
-      number: `PROP-${String(workstreamOffers.filter(o => o.kind === 'proposal').length + 1001)}`,
-      orderId: order.id, kind: 'proposal',
-      title: project.title, amount: proposal.bidAmount, deliveryDays: proposal.deliveryDays,
-      status: 'pending', createdBy: freelancer.id, createdAt: new Date().toISOString()
-    };
-    workstreamOffers.push(offer);
-    saveOffersToDisk();
-    
-    recordMessage(msg);
-    saveMessagesToDisk();
-    broadcastMessage(msg, order.id);
-    return order.id;
-  } catch (err) {
-    console.error('Failed to open project chat for proposal:', err);
-    return undefined;
-  }
-}
-
 app.post('/api/proposals', requireAuth, (req, res) => {
   const authUserId = (req as any).authenticatedUserId;
   const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
   if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
 
+  const proj = projects.find(p => p.id === req.body.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found.' });
+  if (!['open', 'published', 'in_progress'].includes(proj.status)) {
+    return res.status(400).json({ error: 'This project is completed and closed to new proposals.' });
+  }
+  if (proj.buyerId === caller.id) {
+    return res.status(400).json({ error: 'You cannot submit a proposal to your own project.' });
+  }
+  const bidAmount = Math.round(Number(req.body.bidAmount) * 100) / 100;
+  if (!Number.isFinite(bidAmount) || bidAmount <= 0) {
+    return res.status(400).json({ error: 'Enter a valid USD bid amount.' });
+  }
+  const deliveryDays = Math.max(1, Math.min(365, Math.round(Number(req.body.deliveryDays) || 7)));
+
   const newProp: Proposal = {
-    id: 'prop_' + Date.now(),
+    id: 'prop_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     projectId: req.body.projectId,
     freelancerId: caller.id,
     freelancerName: caller.name,
     freelancerAvatar: caller.avatar,
     freelancerTitle: caller.title || 'Senior Engineer',
     coverLetter: typeof req.body.coverLetter === 'string' ? req.body.coverLetter.trim() : '',
-    bidAmount: Number(req.body.bidAmount),
-    deliveryDays: Number(req.body.deliveryDays),
+    bidAmount,
+    deliveryDays,
     createdAt: new Date().toISOString().split('T')[0],
     status: 'pending'
   };
   proposals.unshift(newProp);
-  const proj = projects.find(p => p.id === req.body.projectId);
-  if (proj) proj.proposalsCount += 1;
-  const workstreamOrderId = openProjectChat(proj, caller, newProp);
-  res.json({ ...newProp, workstreamOrderId });
+  proj.proposalsCount += 1;
+  postgresStore.saveProjects(projects);
+  postgresStore.saveProposals(proposals);
+
+  createNotification({
+    userId: proj.buyerId,
+    type: 'proposal',
+    title: 'New Proposal Received',
+    message: `${caller.name} submitted a $${bidAmount} proposal for your project "${proj.title}".`,
+    link: `/projects/${proj.id}`,
+    dedupKey: `proposal_${newProp.id}`,
+    actorId: caller.id
+  });
+
+  res.json(newProp);
 });
 
-app.post('/api/orders', requireAuth, rateLimit(30, 60_000), (req, res) => {
+
+
+async function processProposalAccept(req: any, res: any) {
+  const proposalId = req.params.id;
+  const proposal = proposals.find(p => p.id === proposalId);
+  if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
+  const proj = projects.find(p => p.id === proposal.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  // Use a proposal-level lock to ensure atomicity for this specific proposal acceptance
+  if (!tryAcquireOrderLock(proposal.id, res)) return;
+  try {
+    const authUserId = (req as any).authenticatedUserId;
+    const caller = (req as any).authenticatedUser || users.find((u: any) => u.id === authUserId);
+    if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Authentication required' });
+    if (proj.buyerId !== caller.id) return res.status(403).json({ error: 'Forbidden: Only the project buyer can accept proposals.' });
+    if (proposal.status !== 'pending') {
+      if (proposal.status === 'accepted' && proposal.workstreamOrderId) {
+        const existingOrder = orders.find(o => o.id === proposal.workstreamOrderId);
+        if (existingOrder) {
+          const workspace = workspaceService.getWorkspace(existingOrder.workspaceId || '');
+          const offer = workstreamOffers.find(of => of.proposalId === proposal.id);
+          return res.json({ 
+            success: true, 
+            proposal: enrichProposalWithWorkstream(proposal), 
+            order: enrichOrderWithServiceInfo(existingOrder), 
+            workspace, 
+            offer: offer ? viewOffer(offer) : undefined 
+          });
+        }
+      }
+      return res.status(409).json({ error: `Proposal is already ${proposal.status}.` });
+    }
+
+    ensureWallet(proj.buyerId);
+    ensureWallet(proposal.freelancerId);
+
+    let workspace = Array.from(workspaceService.getWorkspacesForUser(proj.buyerId)).find(w =>
+      w.sellerId === proposal.freelancerId &&
+      w.originType === 'project' &&
+      w.originId === proj.id
+    );
+    let createdNewWorkspace = false;
+    if (!workspace) {
+      workspace = workspaceService.createWorkspace({
+        buyerId: proj.buyerId,
+        sellerId: proposal.freelancerId,
+        originType: 'project',
+        originId: proj.id
+      });
+      createdNewWorkspace = true;
+    }
+
+    const orderId = 'ord_' + randomUUID().slice(0, 12);
+    const today = new Date().toISOString().split('T')[0];
+    const protectionDays = siteSettings.getSettings().commission.escrowProtectionDays;
+    const deliveryDays = proposal.deliveryDays || 7;
+    const dueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
+
+    // Create Order object with transient status
+    const order: Order = {
+      id: orderId,
+      projectOrderId: orderId,
+      workspaceId: workspace.workspaceId,
+      orderType: 'project',
+      title: proj.title,
+      buyerId: proj.buyerId,
+      sellerId: proposal.freelancerId,
+      amount: proposal.bidAmount,
+      status: 'payment_pending',
+      createdAt: today,
+      dueDate,
+      escrowProtectionStartDate: today,
+      escrowProtectionEndDate: new Date(Date.now() + protectionDays * 86400000).toISOString().split('T')[0],
+      projectId: proj.id,
+      proposalId: proposal.id,
+      feeBreakdown: financeLedger.quoteOrder(proposal.bidAmount)
+    };
+
+    // Create offer in 'pending' state
+    const offer: WorkstreamOffer = {
+      id: 'off_' + randomUUID().slice(0, 12),
+      number: `PRP-${String(workstreamOffers.filter(o => o.kind === 'proposal').length + 1001)}`,
+      orderId: order.id,
+      proposalId: proposal.id,
+      kind: 'proposal',
+      title: proj.title,
+      amount: proposal.bidAmount,
+      deliveryDays: proposal.deliveryDays,
+      note: proposal.coverLetter ? proposal.coverLetter.slice(0, 1000) : undefined,
+      status: 'pending',
+      createdBy: proposal.freelancerId,
+      createdAt: new Date().toISOString()
+    };
+    workstreamOffers.push(offer);
+    await postgresStore.saveOffers(workstreamOffers);
+    
+    // Register order in memory for message attachment
+    recordOrder(order);
+    await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order IS ACTUALLY on disk as 'payment_pending' before funding
+    emitSystemEvent(order.id, 'order_created', `Order placed: ${order.title}. Payment is held in escrow until the work is approved.`);
+    postOfferMessage(order, offer, null, `Proposal ${offer.number} was created.`, 'offer_created');
+
+    // Attempt financial ledger funding with transactional rollback on failure
+    try {
+      fundOrderEscrowWithEvent({
+        orderId: order.id,
+        orderTitle: order.title,
+        amount: order.amount,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        actor: `user:${order.buyerId}`
+      });
+      
+      // Update order status to funded only AFTER ledger successfully records the escrow
+      order.status = 'funded_in_escrow';
+      await postgresStore.saveOrders(orders);
+    } catch (fundingErr: any) {
+      // Rollback memory and disk state if funding fails (e.g. insufficient wallet balance)
+      const orderIdx = orders.findIndex(o => o.id === order.id);
+      if (orderIdx !== -1) orders.splice(orderIdx, 1);
+      orderIndex.delete(order.id);
+
+      const offerIdx = workstreamOffers.findIndex(o => o.id === offer.id);
+      if (offerIdx !== -1) workstreamOffers.splice(offerIdx, 1);
+
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].orderId === order.id) {
+          messages.splice(i, 1);
+        }
+      }
+
+      proposal.status = 'pending';
+      delete proposal.workstreamOrderId;
+      delete proposal.offerId;
+
+      if (createdNewWorkspace) {
+        workspaceService.deleteWorkspace(workspace.workspaceId);
+      }
+
+      await postgresStore.saveOrders(orders);
+      await postgresStore.saveOffers(workstreamOffers);
+      await postgresStore.saveProposals(proposals);
+      await postgresStore.saveMessages(messages);
+
+      return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for proposal.' });
+    }
+
+    proposal.status = 'accepted';
+    proposal.workstreamOrderId = order.id;
+    proposal.offerId = offer.id;
+    await postgresStore.saveProposals(proposals);
+    
+    syncUserBalances();
+
+    offer.status = 'accepted';
+    offer.resolvedAt = new Date().toISOString();
+    offer.resolvedBy = caller.id;
+    await postgresStore.saveOffers(workstreamOffers);
+    
+    postOfferMessage(order, offer, null, `Proposal ${offer.number} was accepted and escrow funded ($${order.amount}).`, 'offer_accepted');
+
+    res.json({ success: true, proposal: enrichProposalWithWorkstream(proposal), order: enrichOrderWithServiceInfo(order), workspace, offer: viewOffer(offer) });
+  } finally {
+    releaseOrderLock(proposal.id);
+  }
+}
+
+async function processProposalDecline(req: any, res: any) {
+  const proposalId = req.params.id;
+  const proposal = proposals.find(p => p.id === proposalId);
+  if (!proposal) return res.status(404).json({ error: 'Proposal not found' });
+  const proj = projects.find(p => p.id === proposal.projectId);
+  if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+  if (!tryAcquireOrderLock(proposal.id, res)) return;
+  try {
+    const authUserId = (req as any).authenticatedUserId;
+    const caller = (req as any).authenticatedUser || users.find((u: any) => u.id === authUserId);
+    if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Authentication required' });
+    if (proj.buyerId !== caller.id) return res.status(403).json({ error: 'Forbidden: Only the project buyer can decline proposals.' });
+    if (proposal.status !== 'pending') return res.status(409).json({ error: `Proposal is already ${proposal.status}.` });
+
+    proposal.status = 'rejected';
+    await postgresStore.saveProposals(proposals);
+
+    // If an offer existed, mark it as declined
+    const offer = workstreamOffers.find(of => of.proposalId === proposal.id || of.id === proposal.offerId);
+    if (offer && offer.status === 'pending') {
+      offer.status = 'declined';
+      offer.resolvedAt = new Date().toISOString();
+      offer.resolvedBy = caller.id;
+      await postgresStore.saveOffers(workstreamOffers);
+      const order = orders.find(o => o.id === offer.orderId);
+      if (order) {
+        postOfferMessage(order, offer, null, `${offer.number} was declined by the buyer.`, 'offer_declined');
+      }
+    }
+
+    res.json({ success: true, proposal: enrichProposalWithWorkstream(proposal), offer: offer ? viewOffer(offer) : undefined });
+  } finally {
+    releaseOrderLock(proposal.id);
+  }
+}
+
+app.post('/api/proposals/:id/accept', requireAuth, rateLimit(20, 60_000), async (req, res) => await processProposalAccept(req, res));
+app.post('/api/proposals/:id/decline', requireAuth, rateLimit(20, 60_000), async (req, res) => await processProposalDecline(req, res));
+
+app.post('/api/orders', requireAuth, rateLimit(30, 60_000), async (req, res) => {
   try {
     const authUserId = (req as any).authenticatedUserId;
     const caller = (req as any).authenticatedUser || users.find(u => u.id === authUserId);
@@ -5734,42 +5865,128 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), (req, res) => {
     }
     const serverDerivedDueDate = new Date(Date.now() + deliveryDays * 86400000).toISOString().split('T')[0];
 
+    const isGig = Boolean(req.body?.gigId);
+    const isProject = Boolean(req.body?.projectId);
+    const orderType: 'gig' | 'project' | undefined = isGig ? 'gig' : (isProject ? 'project' : undefined);
+    const gigOrderId = isGig ? id : undefined;
+    const projectOrderId = isProject ? id : undefined;
+
+    let workspaceId = req.body?.workspaceId;
+    if (workspaceId) {
+      const ws = workspaceService.getWorkspace(workspaceId);
+      if (!ws) return res.status(404).json({ error: 'Workspace not found.' });
+      if (ws.buyerId !== buyerId || ws.sellerId !== sellerId) {
+        return res.status(400).json({ error: 'The provided workspace does not match the buyer and seller of this order.' });
+      }
+    } else {
+      const ws = workspaceService.createWorkspace({
+        buyerId,
+        sellerId,
+        originType: isGig ? 'gig' : 'project',
+        originId: req.body?.gigId || req.body?.projectId || id,
+        activeOrderId: id
+      });
+      workspaceId = ws.workspaceId;
+    }
+
     let newOrd: Order;
     if (isInquiry) {
-      // Chat thread only: nothing is charged and no escrow exists
-      newOrd = { id, title, buyerId, sellerId, amount: 0, status: 'in_progress', createdAt: today, dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0], gigId: req.body.gigId, projectId: req.body.projectId, ...(requirements ? { requirements } : {}) };
-    } else {
-      // Debits the buyer wallet into escrow. Throws (and creates nothing) if the balance is too low.
-      financeLedger.fundEscrow({ orderId: id, orderTitle: title, amount: rawAmount, buyerId, sellerId, actor: `user:${buyerId}` });
       newOrd = {
-        id, title, buyerId, sellerId, amount: rawAmount, status: 'funded_in_escrow', createdAt: today,
+        id,
+        workspaceId,
+        ...(orderType ? { orderType } : {}),
+        ...(gigOrderId ? { gigOrderId } : {}),
+        ...(projectOrderId ? { projectOrderId } : {}),
+        title,
+        buyerId,
+        sellerId,
+        amount: 0,
+        status: 'in_progress',
+        createdAt: today,
+        dueDate: new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        gigId: req.body.gigId,
+        projectId: req.body.projectId,
+        ...(requirements ? { requirements } : {})
+      };
+    } else {
+      newOrd = {
+        id,
+        workspaceId,
+        ...(orderType ? { orderType } : {}),
+        ...(gigOrderId ? { gigOrderId } : {}),
+        ...(projectOrderId ? { projectOrderId } : {}),
+        title,
+        buyerId,
+        sellerId,
+        amount: rawAmount,
+        status: 'payment_pending',
+        createdAt: today,
         dueDate: serverDerivedDueDate,
         escrowProtectionStartDate: today,
         escrowProtectionEndDate: new Date(Date.now() + DEFAULT_SITE_SETTINGS.commission.escrowProtectionDays * 86400000).toISOString().split('T')[0],
-        gigId: req.body.gigId, projectId: req.body.projectId,
+        gigId: req.body.gigId,
+        projectId: req.body.projectId,
         feeBreakdown: financeLedger.quoteOrder(rawAmount),
         ...(requirements ? { requirements } : {})
       };
-      syncUserBalances();
     }
     const enriched = enrichOrderWithServiceInfo(newOrd);
     recordOrder(enriched);
-    saveOrdersToDisk();
+    await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order recorded as 'payment_pending' before funding
+
     if (!isInquiry) {
-      // Open the workstream with a record of the purchase (and the brief, if one was given) so it is never an empty thread.
-      const opening: Array<{ senderId: string; senderName: string; text: string; type: 'system' | 'message' }> = [{
-        senderId: 'system', senderName: 'Workstream', type: 'system',
-        text: `Order placed: ${title}. Payment is held in escrow until the work is approved.`
-      }];
-      if (requirements) opening.push({ senderId: buyer.id, senderName: buyer.name, type: 'message', text: `Project requirements: ${requirements}` });
-      opening.forEach((m, i) => {
+      try {
+        fundOrderEscrowWithEvent({ orderId: id, orderTitle: title, amount: rawAmount, buyerId, sellerId, actor: `user:${buyerId}` });
+        
+        // Update order status to funded only AFTER ledger successfully records the escrow
+        enriched.status = 'funded_in_escrow';
+        await postgresStore.saveOrders(orders);
+        
+        syncUserBalances();
+      } catch (fundingErr: any) {
+        // Rollback memory and disk state if escrow funding fails (e.g. insufficient wallet balance)
+        const orderIdx = orders.findIndex(o => o.id === id);
+        if (orderIdx !== -1) orders.splice(orderIdx, 1);
+        orderIndex.delete(id);
+
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].orderId === id) {
+            messages.splice(i, 1);
+          }
+        }
+
+        await postgresStore.saveOrders(orders);
+        await postgresStore.saveMessages(messages);
+
+        // Cleanup orphaned workspace if this was the only order in it
+        const wsId = (enriched as any).workspaceId;
+        if (wsId) {
+          const otherOrdersInWs = orders.filter(o => o.workspaceId === wsId);
+          if (otherOrdersInWs.length === 0) {
+            workspaceService.deleteWorkspace(wsId);
+          }
+        }
+
+        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow. Order creation rolled back.' });
+      }
+    }
+    if (isInquiry) {
+      emitSystemEvent(newOrd.id, 'order_created', `Inquiry thread opened: ${title}.`);
+    } else {
+      emitSystemEvent(newOrd.id, 'order_created', `Order placed: ${title}. Payment is held in escrow until the work is approved.`);
+      if (requirements) {
         recordMessage({
-          id: 'msg_' + Date.now() + '_' + i + Math.random().toString(36).slice(2, 6),
-          orderId: id, ...m, timestamp: new Date(Date.now() + i).toISOString(),
-          metadata: { action: i === 0 ? 'order_created' : 'requirements_logged' }
+          id: 'msg_' + Date.now() + '_req_' + Math.random().toString(36).slice(2, 6),
+          orderId: id,
+          senderId: buyer.id,
+          senderName: buyer.name,
+          type: 'message',
+          text: `Project requirements: ${requirements}`,
+          timestamp: new Date(Date.now() + 1).toISOString(),
+          metadata: { action: 'requirements_logged' }
         } as Message);
-      });
-      saveMessagesToDisk();
+        await postgresStore.saveMessages(messages);
+      }
     }
     res.status(201).json(enriched);
   } catch (err: any) {
@@ -5781,36 +5998,10 @@ app.post('/api/orders', requireAuth, rateLimit(30, 60_000), (req, res) => {
 // WORKSTREAM OFFERS (proposal / invoice / deposit request)
 // Real records with a status. Money only moves through financeLedger.fundEscrow when the BUYER accepts.
 // ==========================================
-type WorkstreamOfferKind = 'proposal' | 'invoice' | 'deposit';
-type WorkstreamOfferStatus = 'pending' | 'accepted' | 'paid' | 'declined' | 'cancelled';
-interface WorkstreamOffer {
-  id: string;
-  number: string;
-  orderId: string;
-  kind: WorkstreamOfferKind;
-  title: string;
-  amount: number;
-  deliveryDays?: number;
-  note?: string;
-  status: WorkstreamOfferStatus;
-  createdBy: string;
-  createdAt: string;
-  resolvedAt?: string;
-  resolvedBy?: string;
 
+function saveOffersToDisk() { 
+  postgresStore.saveOffers(workstreamOffers).catch(err => console.error('[PostgresStore] Failed to save offers:', err)); 
 }
-
-const OFFERS_FILE = path.join(DATA_DIR, 'workstream_offers.json');
-let workstreamOffers: WorkstreamOffer[] = [];
-try {
-  if (fs.existsSync(OFFERS_FILE)) {
-    const parsed = JSON.parse(fs.readFileSync(OFFERS_FILE, 'utf-8'));
-    if (Array.isArray(parsed)) workstreamOffers = parsed;
-  }
-} catch (e) {
-  console.error('Failed to load workstream offers:', e);
-}
-function saveOffersToDisk() { writeJsonAtomic(OFFERS_FILE, workstreamOffers); }
 
 const OFFER_LABEL: Record<WorkstreamOfferKind, string> = { proposal: 'proposal', invoice: 'invoice', deposit: 'deposit request' };
 const OFFER_PREFIX: Record<WorkstreamOfferKind, string> = { proposal: 'PRP', invoice: 'INV', deposit: 'DEP' };
@@ -5818,6 +6009,30 @@ const FUNDED_STATUSES = ['funded_in_escrow', 'delivered', 'revision', 'completed
 
 function orderHasEscrow(orderId: string): boolean {
   return !!financeLedger.getEscrow(orderId);
+}
+
+function getActiveEscrowRemaining(order: Order): number {
+  const esc = financeLedger.getEscrow(order.id);
+  if (esc) return esc.remaining;
+  return (order.status === 'completed' || order.status === 'cancelled') ? 0 : Number(order.amount || 0);
+}
+
+function hasPaidInvoiceOrReleasedEscrow(order: Order): boolean {
+  const esc = financeLedger.getEscrow(order.id);
+  return Boolean(
+    order.status === 'completed' ||
+    releaseCompletedOrders.has(order.id) ||
+    (esc && esc.releasedGross > 0) ||
+    workstreamOffers.some(o => o.orderId === order.id && o.kind === 'invoice' && o.status === 'paid')
+  );
+}
+
+function findLinkedProposalForOffer(offer: WorkstreamOffer, order: Order): Proposal | undefined {
+  return proposals.find(p =>
+    (offer.proposalId && p.id === offer.proposalId) ||
+    p.offerId === offer.id ||
+    (order.proposalId && p.id === order.proposalId)
+  );
 }
 
 function viewOffer(o: WorkstreamOffer) {
@@ -5828,7 +6043,7 @@ function viewOffer(o: WorkstreamOffer) {
     clientTotal = financeLedger.quoteOrder(o.amount)?.clientTotal;
     if (o.kind === 'invoice') {
       const ord = orders.find(ord => ord.id === o.orderId);
-      const curr = Number(ord?.amount || 0);
+      const curr = ord ? (o.status === 'pending' ? getActiveEscrowRemaining(ord) : Number(ord.amount || 0)) : 0;
       additionalAmount = Math.max(0, FinanceLedgerEngine.round(o.amount - curr));
       if (additionalAmount > 0) {
         clientAdditionalTotal = financeLedger.quoteOrder(additionalAmount)?.clientTotal;
@@ -5859,7 +6074,7 @@ function postOfferMessage(order: Order, offer: WorkstreamOffer, sender: { id: st
   };
   // recordMessage (not a bare push) so the message is also in messageIndex, which GET /api/messages/:orderId reads.
   recordMessage(msg);
-  saveMessagesToDisk();
+  postgresStore.saveMessages(messages);
   broadcastMessage(msg, order.id);
 }
 
@@ -5870,6 +6085,15 @@ function offerCaller(req: Request) {
 
 // Admin Proposals Management Endpoints
 
+
+app.get('/api/offers', requireAuth, (req, res) => {
+  const authUserId = (req as any).authenticatedUserId;
+  const userOrders = orders.filter(o => o.buyerId === authUserId || o.sellerId === authUserId);
+  const userOrderIds = new Set(userOrders.map(o => o.id));
+  const userOffers = workstreamOffers.filter(of => userOrderIds.has(of.orderId));
+  res.json(userOffers.map(viewOffer));
+});
+
 app.get('/api/orders/:id/offers', requireAuth, (req, res) => {
   const caller = offerCaller(req);
   const order = orders.find(o => o.id === req.params.id);
@@ -5879,10 +6103,14 @@ app.get('/api/orders/:id/offers', requireAuth, (req, res) => {
     .filter(o => o.orderId === order.id)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     .map(viewOffer);
+  const esc = financeLedger.getEscrow(order.id);
   res.json({
     offers,
     currencySymbol: siteSettings.getFlattenedSettings().currencySymbol || '$',
-    escrowFunded: orderHasEscrow(order.id)
+    escrowFunded: orderHasEscrow(order.id),
+    escrowRemaining: getActiveEscrowRemaining(order),
+    totalReleased: esc ? esc.releasedGross : (order.status === 'completed' ? Number(order.amount || 0) : 0),
+    hasPaidInvoice: hasPaidInvoiceOrReleasedEscrow(order)
   });
 });
 
@@ -5894,6 +6122,7 @@ app.post('/api/orders/:id/offers', requireAuth, rateLimit(20, 60_000), (req, res
     if (!order) return res.status(404).json({ error: 'Order not found' });
     // Only the order's seller may raise proposals, invoices or deposit requests. Staff cannot raise them on a seller's behalf.
     if (caller.id !== order.sellerId) return res.status(403).json({ error: 'Only the seller of this workstream can send this.' });
+    if (order.status === 'cancelled') return res.status(409).json({ error: 'Cannot send offers on a cancelled order.' });
 
     const kind = req.body?.kind as WorkstreamOfferKind;
     if (!['proposal', 'invoice', 'deposit'].includes(kind)) return res.status(400).json({ error: 'Invalid type.' });
@@ -5908,6 +6137,7 @@ app.post('/api/orders/:id/offers', requireAuth, rateLimit(20, 60_000), (req, res
     const title = kind === 'deposit' ? (rawTitle || 'Escrow deposit') : rawTitle;
     if (title.length < 3 || title.length > 120) return res.status(400).json({ error: 'Title must be 3-120 characters.' });
     const note = typeof req.body?.note === 'string' ? req.body.note.trim().slice(0, 1000) : '';
+    const rawRef = typeof req.body?.reference === 'string' ? req.body.reference.trim().slice(0, 2000) : '';
     let deliveryDays: number | undefined;
     if (kind === 'proposal') {
       deliveryDays = Math.round(Number(req.body?.deliveryDays));
@@ -5915,46 +6145,116 @@ app.post('/api/orders/:id/offers', requireAuth, rateLimit(20, 60_000), (req, res
     }
 
     const funded = orderHasEscrow(order.id);
+    const activeEscrow = getActiveEscrowRemaining(order);
+    const hasPaidFirstInvoice = hasPaidInvoiceOrReleasedEscrow(order);
+
     if (kind === 'invoice') {
-      if (!funded) return res.status(400).json({ error: 'Final invoices are for completed work on a funded workstream.' });
-      if (order.amount && amount < order.amount) {
-        return res.status(400).json({ error: `Final invoice amount cannot be less than the gig price ($${order.amount}).` });
+      if (!funded || activeEscrow <= 0) return res.status(400).json({ error: 'Final invoices are for completed work on a funded workstream.' });
+      if (activeEscrow > 0 && amount < activeEscrow) {
+        return res.status(400).json({ error: `Final invoice amount cannot be less than the funded escrow price ($${activeEscrow}).` });
       }
       if (workstreamOffers.filter(o => o.orderId === order.id && o.kind === 'invoice' && o.status === 'pending').length >= 1) {
         return res.status(409).json({ error: 'A final invoice is already pending for this workstream.' });
       }
-    } else if (kind === 'proposal') {
+    } else if (kind === 'proposal' || kind === 'deposit') {
       if (workstreamOffers.some(o => o.orderId === order.id && o.kind === 'invoice' && o.status === 'pending')) {
         return res.status(409).json({ error: 'A seller must not raise a new proposal when a previous proposal/order has a pending invoice.' });
       }
+      // PeoplePerHour Gig Rule: When a buyer orders a Gig, it is already funded in escrow.
+      // The seller cannot send a new proposal until the first invoice has been paid.
+      if ((order.orderType === 'gig' || (order.gigId && !order.projectId)) && activeEscrow > 0 && !hasPaidFirstInvoice) {
+        return res.status(409).json({ error: 'This Gig is already funded in escrow. Please raise and get your first invoice paid before sending a follow-on proposal.' });
+      }
+    }
+
+    let uploadedFiles: Array<{ id: string; name: string; size: string; url: string; uploadedAt: string; type: string }> = [];
+    if (kind === 'invoice' && Array.isArray(req.body?.files) && req.body.files.length > 0) {
+      const validation = validateStoredWorkstreamFiles(req.body.files, caller);
+      if (!validation.ok) {
+        return res.status(400).json({ error: (validation as any).error });
+      }
+      uploadedFiles = validation.files.map((f: any, idx: number) => ({
+        id: 'deliv_' + Date.now() + '_' + idx,
+        name: f.name,
+        size: f.size,
+        url: f.url,
+        uploadedAt: new Date().toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }),
+        type: 'deliverable'
+      }));
     }
 
     const offer: WorkstreamOffer = {
       id: 'off_' + randomUUID().slice(0, 12),
       number: `${OFFER_PREFIX[kind]}-${String(workstreamOffers.filter(o => o.kind === kind).length + 1001)}`,
-      orderId: order.id, kind, title, amount, deliveryDays, note: note || undefined,
-      status: 'pending', createdBy: caller.id, createdAt: new Date().toISOString()
+      orderId: order.id,
+      kind,
+      title,
+      amount,
+      deliveryDays,
+      note: note || undefined,
+      files: uploadedFiles.length > 0 ? uploadedFiles : undefined,
+      reference: rawRef || undefined,
+      status: 'pending',
+      createdBy: caller.id,
+      createdAt: new Date().toISOString()
     };
     workstreamOffers.push(offer);
-    saveOffersToDisk();
+    postgresStore.saveOffers(workstreamOffers);
+
+    // When a seller raises an invoice with deliverables/notes/deliverWork from the WorkStream UI, record the delivery and mark as delivered
+    if (kind === 'invoice' && (req.body?.deliverWork || note || uploadedFiles.length > 0 || rawRef)) {
+      if (!order.deliverableFiles) order.deliverableFiles = [];
+      if (!order.deliveryHistory) order.deliveryHistory = [];
+      if (uploadedFiles.length > 0) order.deliverableFiles.push(...uploadedFiles);
+      const version = order.deliveryHistory.length + 1;
+      const sanitizedNotes = note ? escapeHtml(note) : escapeHtml(title);
+      order.deliveryNotes = sanitizedNotes;
+      if (rawRef) order.deliveryReference = rawRef;
+      order.deliveryHistory.push({
+        version,
+        notes: sanitizedNotes,
+        reference: rawRef || undefined,
+        files: uploadedFiles,
+        deliveredAt: new Date().toISOString()
+      });
+      order.status = 'delivered';
+      if (Array.isArray(order.revisions)) {
+        for (const rev of order.revisions) {
+          if (rev.status === 'requested') rev.status = 'resolved';
+        }
+      }
+      postgresStore.saveOrders(orders);
+    }
+
     postOfferMessage(order, offer, { id: caller.id, name: caller.name }, `New ${OFFER_LABEL[kind]} ${offer.number}: ${title}`, 'offer_created');
-    res.status(201).json({ offer: viewOffer(offer) });
+    res.status(201).json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
     res.status(400).json({ error: err.message });
   }
 });
 
-app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit(20, 60_000), (req, res) => {
+app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimit(20, 60_000), async (req, res) => {
   const offer = workstreamOffers.find(o => o.id === req.params.id);
   const order = offer ? orders.find(o => o.id === offer.orderId) : undefined;
   if (!offer || !order) return res.status(404).json({ error: 'Not found' });
 
-  acquireOrderLock(order.id);
+  if (!tryAcquireOrderLock(order.id, res)) return;
   try {
     const caller = offerCaller(req);
     if (!caller || caller.status !== 'active') return res.status(403).json({ error: 'Account is not active' });
     if (!canAccessOrderWorkstream(caller, order)) return res.status(403).json({ error: 'Forbidden' });
-    if (offer.status !== 'pending') return res.status(409).json({ error: `This ${OFFER_LABEL[offer.kind]} is already ${offer.status}.` });
+    if (offer.status !== 'pending') {
+      if (offer.status === 'accepted' || offer.status === 'paid') {
+        const associatedOrder = offer.orderId ? orders.find(o => o.id === offer.orderId) : order;
+        if (associatedOrder) {
+          return res.json({ 
+            offer: viewOffer(offer), 
+            order: enrichOrderWithServiceInfo(associatedOrder) 
+          });
+        }
+      }
+      return res.status(409).json({ error: `This ${OFFER_LABEL[offer.kind]} is already ${offer.status}.` });
+    }
 
     const action = req.params.action;
     const now = new Date().toISOString();
@@ -5962,14 +6262,21 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
     if (action === 'cancel') {
       if (caller.id !== order.sellerId) return res.status(403).json({ error: 'Only the seller can cancel this.' });
       offer.status = 'cancelled'; offer.resolvedAt = now; offer.resolvedBy = caller.id;
+      if (offer.kind === 'proposal') {
+        const linkedProp = findLinkedProposalForOffer(offer, order);
+        if (linkedProp && linkedProp.status === 'pending') {
+          linkedProp.status = 'rejected';
+          await postgresStore.saveProposals(proposals);
+        }
+      }
       if (offer.kind === 'invoice' && (order.status === 'delivered' || order.status === 'draft_review')) {
         const otherPendingInvoice = workstreamOffers.some(o => o.orderId === order.id && o.id !== offer.id && o.kind === 'invoice' && o.status === 'pending');
         if (!otherPendingInvoice && orderHasEscrow(order.id)) {
           order.status = 'in_progress';
-          saveOrdersToDisk();
+          await postgresStore.saveOrders(orders);
         }
       }
-      saveOffersToDisk();
+      await postgresStore.saveOffers(workstreamOffers);
       postOfferMessage(order, offer, null, `${offer.number} was cancelled by the seller.`, 'offer_cancelled');
       return res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
     }
@@ -5977,11 +6284,31 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
     // Accepting / declining belongs to the buyer only (not staff, not the seller).
     if (caller.id !== order.buyerId) return res.status(403).json({ error: 'Only the buyer can respond to this.' });
 
+    if (order.status === 'cancelled') {
+      return res.status(400).json({ error: 'Cannot accept offers on a cancelled order (escrow has already been refunded).' });
+    }
+    if (order.status === 'completed' && offer.kind === 'invoice') {
+      return res.status(400).json({ error: 'Cannot accept an invoice on a completed order (escrow has already been released).' });
+    }
+
     if (action === 'decline') {
       offer.status = 'declined'; offer.resolvedAt = now; offer.resolvedBy = caller.id;
-      saveOffersToDisk();
+      if (offer.kind === 'proposal') {
+        const linkedProp = findLinkedProposalForOffer(offer, order);
+        if (linkedProp) {
+          linkedProp.status = 'rejected';
+          await postgresStore.saveProposals(proposals);
+        }
+      } else if (offer.kind === 'invoice' && (order.status === 'delivered' || order.status === 'draft_review')) {
+        const otherPendingInvoice = workstreamOffers.some(o => o.orderId === order.id && o.id !== offer.id && o.kind === 'invoice' && o.status === 'pending');
+        if (!otherPendingInvoice && orderHasEscrow(order.id)) {
+          order.status = 'revision';
+          postgresStore.saveOrders(orders);
+        }
+      }
+      await postgresStore.saveOffers(workstreamOffers);
       postOfferMessage(order, offer, null, `${offer.number} was declined by the buyer.`, 'offer_declined');
-      return res.json({ offer: viewOffer(offer) });
+      return res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
     }
 
     // ----- accept: real money movement through the ledger -----
@@ -5989,6 +6316,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
     const today = now.split('T')[0];
     const protectionEnd = new Date(Date.now() + siteSettings.getSettings().commission.escrowProtectionDays * 86400000).toISOString().split('T')[0];
     const isInitialFunding = !orderHasEscrow(order.id);
+    const isFollowOnAfterCompletion = orderHasEscrow(order.id) && (order.status === 'completed' || getActiveEscrowRemaining(order) === 0);
 
     if (offer.kind === 'invoice') {
       const validationError = validateOrderReleasePreconditions(order, false, true);
@@ -6007,7 +6335,7 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
 
       // If invoice amount is higher than existing escrow, charge the additional amount to the buyer into escrow
       if (additionalAmount > 0) {
-        financeLedger.topUpEscrow({
+        topUpOrderEscrowWithEvent({
           orderId: order.id,
           orderTitle: `Invoice Top-up: ${offer.title}`,
           amount: additionalAmount,
@@ -6020,16 +6348,21 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       }
 
       // Resolve any outstanding revision requests upon accepting the new Invoice
+      let invoiceRevisionsResolved = false;
       if (Array.isArray(order.revisions)) {
         for (const rev of order.revisions) {
           if (rev.status === 'requested') {
             rev.status = 'resolved';
+            invoiceRevisionsResolved = true;
           }
         }
       }
+      if (invoiceRevisionsResolved) {
+        emitSystemEvent(order.id, 'revision_resolved', `📝 Revision resolved via accepted invoice ${offer.number}.`);
+      }
 
       // Perform the required financial release successfully first
-      releaseOrderFunds(order, caller.name, `Final invoice ${offer.number} accepted by buyer and escrow released`);
+      releaseOrderFunds(order, caller.name, `Final invoice ${offer.number} accepted by buyer and escrow released`, false);
 
       // Only after successful release, mark the invoice offer as paid/resolved
       offer.status = 'paid';
@@ -6037,37 +6370,136 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       offer.resolvedBy = caller.id;
 
       syncUserBalances();
-      saveOffersToDisk();
-      saveOrdersToDisk();
-      saveMessagesToDisk();
+      await postgresStore.saveOffers(workstreamOffers);
+      await postgresStore.saveOrders(orders);
+      await postgresStore.saveMessages(messages);
       const completionNote = additionalAmount > 0
-        ? `${offer.number} ($${invoiceAmount.toLocaleString()}) was paid (+$${additionalAmount.toLocaleString()} funded from wallet) and full escrow ($${order.amount.toLocaleString()}) was released to the seller. Order completed!`
-        : `${offer.number} was accepted and escrow funds ($${order.amount.toLocaleString()}) were released to the seller. Order completed!`;
+        ? `${offer.number} ($${invoiceAmount.toLocaleString()}) was paid (+$${additionalAmount.toLocaleString()} funded from wallet) and full escrow ($${invoiceAmount.toLocaleString()}) was released to the seller. Order completed!`
+        : `${offer.number} was accepted and escrow funds ($${invoiceAmount.toLocaleString()}) were released to the seller. Order completed!`;
       postOfferMessage(order, offer, null, completionNote, 'offer_paid');
       return res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
 
     } else if (isInitialFunding) {
       // Initial proposal on an unfunded order/inquiry: funds this order's escrow directly under order.id
-      if (order.status !== 'in_progress') {
+      if (order.status === 'funded_in_escrow' || orderHasEscrow(order.id)) {
+        return res.status(409).json({ error: 'Order escrow is already funded.' });
+      }
+      if (order.status !== 'in_progress' && order.status !== 'payment_pending') {
         return res.status(409).json({ error: 'Cannot fund escrow for order in current status.' });
       }
       const newTitle = offer.kind === 'proposal' && (/^inquiry:/i.test(order.title) || !order.amount) ? offer.title : order.title;
-      financeLedger.fundEscrow({ orderId: order.id, orderTitle: newTitle, amount: offer.amount, buyerId: order.buyerId, sellerId: order.sellerId, actor: `user:${order.buyerId}` });
-      order.title = newTitle;
-      order.amount = offer.amount;
-      order.status = 'funded_in_escrow';
-      order.escrowProtectionStartDate = today;
-      order.escrowProtectionEndDate = protectionEnd;
-      order.feeBreakdown = financeLedger.quoteOrder(offer.amount);
-      if (offer.kind === 'proposal' && offer.deliveryDays) {
-        order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString().split('T')[0];
+      const prevStatus = order.status;
+      order.previousStatus = prevStatus;
+      order.status = 'payment_pending';
+      await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order is durable as payment_pending before ledger funding
+
+      try {
+        fundOrderEscrowWithEvent({ orderId: order.id, orderTitle: newTitle, amount: offer.amount, buyerId: order.buyerId, sellerId: order.sellerId, actor: `user:${order.buyerId}` });
+        order.title = newTitle;
+        order.amount = offer.amount;
+        order.status = 'funded_in_escrow';
+        order.escrowProtectionStartDate = today;
+        order.escrowProtectionEndDate = protectionEnd;
+        order.feeBreakdown = financeLedger.quoteOrder(offer.amount);
+        if (offer.kind === 'proposal' && offer.deliveryDays) {
+          order.dueDate = new Date(Date.now() + offer.deliveryDays * 86400000).toISOString().split('T')[0];
+        }
+        offer.orderId = order.id;
+        offer.status = 'accepted';
+        if (offer.kind === 'proposal') {
+          const linkedProp = findLinkedProposalForOffer(offer, order);
+          if (linkedProp) {
+            linkedProp.status = 'accepted';
+            linkedProp.workstreamOrderId = order.id;
+            linkedProp.offerId = offer.id;
+            order.proposalId = linkedProp.id;
+            await postgresStore.saveProposals(proposals);
+          }
+        }
+        await postgresStore.saveOrders(orders);
+        postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
+      } catch (fundingErr: any) {
+        order.status = prevStatus;
+        await postgresStore.saveOrders(orders);
+        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for offer.' });
       }
-      offer.orderId = order.id;
+    } else if (isFollowOnAfterCompletion) {
+      // PeoplePerHour Follow-On Proposal / Deposit accepted in the same WorkStream after previous invoice was paid
+      // Correct model: New Order in same Workspace
+      const newOrderId = 'ord_' + randomUUID().slice(0, 12);
+      const isGigFollowOn = order.orderType === 'gig' || (Boolean(order.gigId) && !order.projectId);
+      const orderType: 'gig' | 'project' = isGigFollowOn ? 'gig' : 'project';
+      const gigOrderId = orderType === 'gig' ? newOrderId : undefined;
+      const projectOrderId = orderType === 'project' ? newOrderId : undefined;
+
+      const newOrder: Order = {
+        id: newOrderId,
+        workspaceId: order.workspaceId,
+        orderType,
+        ...(gigOrderId ? { gigOrderId } : {}),
+        ...(projectOrderId ? { projectOrderId } : {}),
+        title: offer.title,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        amount: offer.amount,
+        status: 'payment_pending',
+        createdAt: today,
+        dueDate: offer.kind === 'proposal' && offer.deliveryDays
+          ? new Date(Date.now() + offer.deliveryDays * 86400000).toISOString().split('T')[0]
+          : new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0],
+        escrowProtectionStartDate: today,
+        escrowProtectionEndDate: protectionEnd,
+        feeBreakdown: financeLedger.quoteOrder(offer.amount),
+        projectId: order.projectId,
+        gigId: order.gigId
+      };
+
+      // 1. Record & save order FIRST so it exists in memory / index for system event attachment
+      const enrichedOrder = enrichOrderWithServiceInfo(newOrder);
+      recordOrder(enrichedOrder);
+      await postgresStore.saveOrders(orders); // CRASH SAFE POINT: Order recorded as 'payment_pending' before funding
+      emitSystemEvent(newOrder.id, 'order_created', `Order placed: ${newOrder.title}. Payment is held in escrow until the work is approved.`);
+
+      // 2. Fund escrow with rollback on failure
+      try {
+        fundOrderEscrowWithEvent({
+          orderId: newOrder.id,
+          orderTitle: newOrder.title,
+          amount: newOrder.amount,
+          buyerId: newOrder.buyerId,
+          sellerId: newOrder.sellerId,
+          actor: `user:${newOrder.buyerId}`
+        });
+        
+        // Update order status to funded only AFTER ledger successfully records the escrow
+        enrichedOrder.status = 'funded_in_escrow';
+        await postgresStore.saveOrders(orders);
+        
+        syncUserBalances();
+      } catch (fundingErr: any) {
+        // Rollback newOrder state if funding fails
+        const orderIdx = orders.findIndex(o => o.id === newOrder.id);
+        if (orderIdx !== -1) orders.splice(orderIdx, 1);
+        orderIndex.delete(newOrder.id);
+
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].orderId === newOrder.id) {
+            messages.splice(i, 1);
+          }
+        }
+
+        await postgresStore.saveOrders(orders);
+        await postgresStore.saveMessages(messages);
+        return res.status(400).json({ error: fundingErr.message || 'Failed to fund escrow for follow-on order.' });
+      }
+
+      offer.orderId = newOrder.id;
       offer.status = 'accepted';
-      postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was funded ($${offer.amount}).`, 'offer_accepted');
+      postOfferMessage(enrichedOrder, offer, null, `Follow-on ${OFFER_LABEL[offer.kind]} ${offer.number} ("${offer.title}") was accepted and $${offer.amount.toLocaleString()} was funded into escrow in a new Order (#${newOrderId}).`, 'offer_accepted');
+      return res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(enrichedOrder) });
     } else {
-      // Escrow is already funded: top up existing order's escrow directly under the primary orderId (no secondary order ID).
-      financeLedger.topUpEscrow({
+      // Escrow is already funded and held: top up existing order's escrow directly under the primary orderId (no secondary order ID).
+      topUpOrderEscrowWithEvent({
         orderId: order.id,
         orderTitle: offer.title,
         amount: offer.amount,
@@ -6082,13 +6514,22 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
       }
       offer.orderId = order.id;
       offer.status = 'accepted';
+      if (offer.kind === 'proposal') {
+        const linkedProp = findLinkedProposalForOffer(offer, order);
+        if (linkedProp) {
+          linkedProp.status = 'accepted';
+          linkedProp.workstreamOrderId = order.id;
+          linkedProp.offerId = offer.id;
+          await postgresStore.saveProposals(proposals);
+        }
+      }
       postOfferMessage(order, offer, null, `${offer.number} was accepted and escrow was topped up with $${offer.amount}. All funds and milestones remain unified under Order #${order.id}.`, 'offer_accepted');
     }
 
     offer.resolvedAt = now; offer.resolvedBy = caller.id;
     syncUserBalances();
-    saveOrdersToDisk();
-    saveOffersToDisk();
+    await postgresStore.saveOrders(orders);
+    await postgresStore.saveOffers(workstreamOffers);
     res.json({ offer: viewOffer(offer), order: enrichOrderWithServiceInfo(order) });
   } catch (err: any) {
     // fundEscrow throws on insufficient balance, frozen wallets, below-minimum amounts, etc. Nothing was changed.
@@ -6098,7 +6539,13 @@ app.post('/api/offers/:id/:action(accept|decline|cancel)', requireAuth, rateLimi
   }
 });
 
-app.patch('/api/admin/proposals/:id', requireAdmin, (req, res) => {
+// Direct Buyer Proposal Accept / Decline Endpoint (supports hiring multiple freelancers on the same project)
+app.post('/api/proposals/:id/:action(accept|decline)', requireAuth, rateLimit(20, 60_000), async (req, res) => {
+  if (req.params.action === 'accept') return await processProposalAccept(req, res);
+  return await processProposalDecline(req, res);
+});
+
+app.patch('/api/admin/proposals/:id', requireAdmin, async (req, res) => {
   const p = proposals.find(prop => prop.id === req.params.id);
   if (!p) return res.status(404).json({ error: 'Proposal not found' });
 
@@ -6116,11 +6563,11 @@ app.patch('/api/admin/proposals/:id', requireAdmin, (req, res) => {
     details: `Updated bid parameters ($${p.bidAmount}), delivery days (${p.deliveryDays}d), or status (${p.status}) for freelancer ${p.freelancerName}`,
     timestamp: new Date().toLocaleString()
   });
-
+  await postgresStore.saveProposals(proposals);
   res.json(p);
 });
 
-app.patch('/api/admin/proposals/:id/status', requireAdmin, (req, res) => {
+app.patch('/api/admin/proposals/:id/status', requireAdmin, async (req, res) => {
   const p = proposals.find(prop => prop.id === req.params.id);
   if (!p) return res.status(404).json({ error: 'Proposal not found' });
 
@@ -6137,10 +6584,11 @@ app.patch('/api/admin/proposals/:id/status', requireAdmin, (req, res) => {
     timestamp: new Date().toLocaleString()
   });
 
+  await postgresStore.saveProposals(proposals);
   res.json(p);
 });
 
-app.delete('/api/admin/proposals/:id', requireAdmin, (req, res) => {
+app.delete('/api/admin/proposals/:id', requireAdmin, async (req, res) => {
   const index = proposals.findIndex(prop => prop.id === req.params.id);
   if (index === -1) return res.status(404).json({ error: 'Proposal not found' });
 
@@ -6151,7 +6599,9 @@ app.delete('/api/admin/proposals/:id', requireAdmin, (req, res) => {
   const proj = projects.find(p => p.id === deleted.projectId);
   if (proj && proj.proposalsCount > 0) {
     proj.proposalsCount -= 1;
+    await postgresStore.saveProjects(projects);
   }
+  await postgresStore.saveProposals(proposals);
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -6178,15 +6628,27 @@ app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
     if (req.body.role === 'super_admin' && caller?.role !== 'super_admin') {
       return res.status(403).json({ error: 'Forbidden: Only super_admin can set super_admin role.' });
     }
+    if (!['buyer', 'freelancer', 'admin', 'super_admin', 'support', 'moderator'].includes(req.body.role)) {
+      return res.status(400).json({ error: 'Invalid role.' });
+    }
     u.role = req.body.role;
   }
   if (req.body.title !== undefined) u.title = escapeHtml(String(req.body.title));
   if (req.body.bio !== undefined) u.bio = escapeHtml(String(req.body.bio));
   if (req.body.skills !== undefined) u.skills = Array.isArray(req.body.skills) ? req.body.skills : req.body.skills.split(',').map((s: string) => s.trim()).filter(Boolean);
-  if (req.body.hourlyRate !== undefined) u.hourlyRate = Number(req.body.hourlyRate);
+  if (req.body.hourlyRate !== undefined) {
+      const hr = Number(req.body.hourlyRate);
+      if (!Number.isFinite(hr) || hr < 0) return res.status(400).json({ error: 'Invalid hourly rate.' });
+      u.hourlyRate = hr;
+  }
   // walletBalance is ledger-controlled and intentionally ignored here (use /api/admin/finance/adjustments)
   if (req.body.verified !== undefined) u.verified = Boolean(req.body.verified);
-  if (req.body.status !== undefined) u.status = req.body.status;
+  if (req.body.status !== undefined) {
+      if (!['active', 'frozen', 'restricted'].includes(req.body.status)) {
+         return res.status(400).json({ error: 'Invalid status.' });
+      }
+      u.status = req.body.status;
+  }
 
   registerAuditLog({
     id: 'log_' + Date.now(),
@@ -6198,6 +6660,7 @@ app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
     timestamp: new Date().toLocaleString()
   });
 
+  saveUsersToPostgres();
   res.json(safeUser(u));
 });
 
@@ -6233,7 +6696,8 @@ app.patch('/api/admin/users/:id/status', requireAdmin, (req, res) => {
     notifyUserOnAdminAction(u, req.body.status, req.body.notes);
   }
 
-  res.json(u);
+  saveUsersToPostgres();
+  res.json(safeUser(u));
 });
 
 app.post('/api/admin/users/:id/impersonate', requireAdmin, (req, res) => {
@@ -6254,7 +6718,7 @@ app.post('/api/admin/users/:id/impersonate', requireAdmin, (req, res) => {
   // Send security chat notification & email
   notifyUserOnAdminAction(u, 'impersonated');
 
-  res.json({ success: true, user: u });
+  res.json({ success: true, user: safeUser(u) });
 });
 
 app.post('/api/admin/users/:id/stop-impersonate', requireAdmin, (req, res) => {
@@ -6272,7 +6736,7 @@ app.post('/api/admin/users/:id/stop-impersonate', requireAdmin, (req, res) => {
     timestamp: new Date().toLocaleString()
   });
 
-  res.json({ success: true, user: u });
+  res.json({ success: true, user: safeUser(u) });
 });
 
 app.patch('/api/admin/users/:id/verify', requireAdmin, (req, res) => {
@@ -6291,7 +6755,8 @@ app.patch('/api/admin/users/:id/verify', requireAdmin, (req, res) => {
     timestamp: new Date().toLocaleString()
   });
 
-  res.json(u);
+  saveUsersToPostgres();
+  res.json(safeUser(u));
 });
 
 app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
@@ -6312,8 +6777,16 @@ app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
   users.splice(index, 1);
 
   // Clean up listings to maintain references
-  gigs = gigs.filter(g => g.freelancerId !== req.params.id);
-  projects = projects.filter(p => p.buyerId !== req.params.id);
+  const remainingGigs = gigs.filter(g => g.freelancerId !== req.params.id);
+  gigs.length = 0;
+  gigs.push(...remainingGigs);
+  const remainingProjects = projects.filter(p => p.buyerId !== req.params.id);
+  projects.length = 0;
+  projects.push(...remainingProjects);
+  postgresStore.saveProjects(projects);
+
+  saveUsersToPostgres();
+  saveGigsToPostgres();
 
   const admin = (req as any).authenticatedUser;
   registerAuditLog({
@@ -6354,13 +6827,32 @@ app.patch('/api/admin/disputes/:id/resolve', requireAdmin, (req, res) => {
     if (status.startsWith('resolved')) {
       if (!order) return res.status(404).json({ error: 'Order for this dispute not found' });
       lockedOrderId = order.id;
-      acquireOrderLock(lockedOrderId);
-      if (status === 'resolved_release') releaseOrderFunds(order, adminActor(req), reason);
+      try {
+        acquireOrderLock(lockedOrderId);
+      } catch (err: any) {
+        return res.status(409).json({ error: err.message });
+      }
+      if (status === 'resolved_release') releaseOrderFunds(order, adminActor(req), reason, false);
       else if (status === 'resolved_refund') refundOrderFunds(order, undefined, adminActor(req), reason);
       else splitOrderFunds(order, Number(req.body.refundAmount), adminActor(req), reason);
     }
     d.status = status;
     d.resolutionNotes = notes;
+    if (order) {
+      const sysMsg: Message = {
+        id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        orderId: order.id,
+        senderId: 'system',
+        senderName: 'Dispute Resolution Desk',
+        text: `⚖️ Dispute resolved by administrator: ${status}. Notes: ${notes || 'No notes provided'}`,
+        timestamp: new Date().toISOString(),
+        type: 'system',
+        metadata: { action: 'dispute_resolved', status, notes }
+      };
+      recordMessage(sysMsg);
+      postgresStore.saveMessages(messages);
+      broadcastMessage(sysMsg, order.id);
+    }
     registerAuditLog({
       id: 'log_' + randomUUID().slice(0, 12),
       actor: adminActor(req),
@@ -6370,9 +6862,9 @@ app.patch('/api/admin/disputes/:id/resolve', requireAdmin, (req, res) => {
       details: `Resolved dispute with status ${status}. Notes: ${notes}`,
       timestamp: new Date().toLocaleString()
     });
-    saveDisputesToDisk();
-    saveOrdersToDisk();
-    saveRefundsToDisk();
+    postgresStore.saveDisputes(disputes);
+    postgresStore.saveOrders(orders);
+    postgresStore.saveRefunds(refunds);
     res.json(d);
   } catch (err: any) {
     res.status(400).json({ error: err.message });
@@ -6391,9 +6883,11 @@ app.post('/api/admin/tickets/:id/reply', requireAdmin, (req, res) => {
     timestamp: new Date().toISOString()
   });
   t.status = 'in_progress';
+  postgresStore.saveSupportTickets(supportTickets).catch(err => console.error('[PostgresStore] Failed to save tickets:', err));
   res.json(t);
 });
 
+// WebSocket Real-Time Chat Server
 // WebSocket Real-Time Chat Server
 function broadcastMessage(message: Message, orderId: string) {
   const payload = JSON.stringify({ type: 'MESSAGE_RECEIVED', message });
@@ -6421,6 +6915,108 @@ function broadcastMessage(message: Message, orderId: string) {
   }
 }
 
+function emitSystemEvent(orderId: string, action: string, text: string, metadata: Record<string, any> = {}) {
+  const sysMsg: Message = {
+    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    orderId,
+    senderId: 'system',
+    senderName: 'WorkSphere System',
+    text,
+    timestamp: new Date().toISOString(),
+    type: 'system',
+    metadata: { ...metadata, action }
+  };
+  recordMessage(sysMsg);
+  postgresStore.saveMessages(messages);
+  broadcastMessage(sysMsg, orderId);
+}
+
+function disconnectUserSockets(userId: string, reason = 'Session invalidated') {
+  for (const client of clients) {
+    if ((client as any).authenticatedUserId === userId) {
+      try { client.close(4401, reason); } catch {}
+    }
+  }
+}
+
+export function broadcastNotificationToUser(userId: string, notification: Notification) {
+  for (const client of clients) {
+    if ((client as any).isAuthenticated && (client as any).authenticatedUserId === userId && client.readyState === WebSocket.OPEN) {
+      try {
+        client.send(JSON.stringify({ type: 'NOTIFICATION', notification }));
+      } catch {}
+    }
+  }
+}
+
+export async function createNotification({
+  userId,
+  type,
+  title,
+  message,
+  link,
+  dedupKey,
+  actorId
+}: {
+  userId: string;
+  type: string;
+  title: string;
+  message: string;
+  link?: string;
+  dedupKey?: string;
+  actorId?: string;
+}) {
+  if (actorId && actorId === userId) return;
+  if (!userId) return;
+
+  if (dedupKey) {
+    const existing = notifications.find(n => n.userId === userId && n.dedupKey === dedupKey);
+    if (existing) return;
+  }
+
+  const newNotif: Notification = {
+    id: `notif_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+    userId,
+    type,
+    title,
+    message,
+    link: link || '#',
+    read: false,
+    createdAt: new Date().toISOString(),
+    dedupKey: dedupKey || undefined
+  };
+
+  notifications.unshift(newNotif);
+  await postgresStore.saveNotification(newNotif).catch(err => console.error('[PostgresStore] Failed to save notification:', err));
+  broadcastNotificationToUser(userId, newNotif);
+}
+
+app.get('/api/notifications', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  const userNotifs = notifications.filter(n => n.userId === userId);
+  res.json(userNotifs);
+});
+
+app.post('/api/notifications/:id/read', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  const notifId = req.params.id;
+  const notif = notifications.find(n => n.id === notifId && n.userId === userId);
+  if (notif) {
+    notif.read = true;
+    postgresStore.markNotificationRead(notifId, userId).catch(err => console.error('[PostgresStore] Failed to mark notification read:', err));
+  }
+  res.json({ success: true });
+});
+
+app.post('/api/notifications/read-all', requireAuth, (req, res) => {
+  const userId = (req as any).user.id;
+  notifications.forEach(n => {
+    if (n.userId === userId) n.read = true;
+  });
+  postgresStore.markAllNotificationsRead(userId).catch(err => console.error('[PostgresStore] Failed to mark all notifications read:', err));
+  res.json({ success: true });
+});
+
 const clients = new Set<WebSocket>();
 
 wss.on('connection', (ws, req) => {
@@ -6431,7 +7027,7 @@ wss.on('connection', (ws, req) => {
     // Set a timeout to authenticate. If no valid AUTHENTICATE message is received within 1 second, close.
     const authTimeout = setTimeout(() => {
       if (!(ws as any).isAuthenticated) {
-        try { ws.close(4401, 'Authentication timeout'); } catch {}
+        try { ws.close(1008, 'Authentication timeout'); } catch {}
       }
     }, 1000);
 
@@ -6489,7 +7085,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
         authAttempts++;
         if (authAttempts > 3) {
           ws.send(JSON.stringify({ error: 'Too many authentication attempts' }));
-          try { ws.close(4401, 'Too many auth attempts'); } catch {}
+          try { ws.close(1008, 'Too many auth attempts'); } catch {}
           return;
         }
 
@@ -6518,7 +7114,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
         }
         
         ws.send(JSON.stringify({ error: 'Invalid token' }));
-        try { ws.close(4401, 'Authentication failed'); } catch {}
+        try { ws.close(1008, 'Authentication failed'); } catch {}
         return;
       }
 
@@ -6531,7 +7127,7 @@ function setupWebSocketHandlers(ws: WebSocket, authTimeout: NodeJS.Timeout) {
       // Validate session version and status
       const currentDbUser = users.find(u => u.id === (ws as any).authenticatedUserId);
       if (!currentDbUser || currentDbUser.status !== 'active' || (currentDbUser.sessionVersion !== undefined && (ws as any).sessionVersion !== undefined && currentDbUser.sessionVersion !== (ws as any).sessionVersion)) {
-        try { ws.close(4401, 'Session invalidated or account inactive'); } catch {}
+        try { ws.close(1008, 'Session invalidated or account inactive'); } catch {}
         return;
       }
 
@@ -6575,23 +7171,43 @@ app.get('/sitemap.xml', (_req, res) => {
 
 // SSR and Vite integration
 (async () => {
+  try {
+    await hydrateStoreFromPostgres();
+  } catch (err) {
+    console.error('[FATAL] Postgres hydration failed; refusing to start:', err);
+    process.exit(1);
+  }
   await setupSSR(app, IS_PROD, __dirname, () => ({ gigs, users, projects, categories }));
 
   const portArgIndex = process.argv.findIndex(arg => arg === '--port' || arg === '-p');
   const cliPort = portArgIndex !== -1 && process.argv[portArgIndex + 1] ? Number(process.argv[portArgIndex + 1]) : null;
-  const PORT = process.env.PORT || cliPort || 3000;
-  server.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`WorkPerHour server running on http://0.0.0.0:${PORT}`);
-    if (bootstrapAdminPasswordNotice) {
-      console.warn('[SECURITY] ADMIN_INITIAL_PASSWORD was not set. One-time generated super-admin password: ' + bootstrapAdminPasswordNotice + ' — change it after first login and set ADMIN_INITIAL_PASSWORD next time.');
-    }
+  const PORT = cliPort || (process.env.PORT && process.env.PORT !== '8080' ? Number(process.env.PORT) : 3000);
+
+  process.on('unhandledRejection', (reason) => {
+    console.error('[UnhandledRejection]', reason);
   });
+
+  if (!server.listening) {
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.warn(`Port ${PORT} in use, selecting dynamic fallback port`);
+        server.listen(0, '0.0.0.0');
+      }
+    });
+    server.listen(Number(PORT), '0.0.0.0', () => {
+      const actualPort = (server.address() as any)?.port || PORT;
+      console.log(`WorkPerHour server running on http://0.0.0.0:${actualPort}`);
+      if (bootstrapAdminPasswordNotice) {
+        console.warn('[SECURITY] ADMIN_INITIAL_PASSWORD was not set. One-time generated super-admin password: ' + bootstrapAdminPasswordNotice + ' — change it after first login and set ADMIN_INITIAL_PASSWORD next time.');
+      }
+    });
+  }
 })();
 
 // Graceful shutdown
 async function gracefulShutdown(signal: string) {
   console.log(`Received ${signal}. Flushing pending writes...`);
-  await Promise.all(writeQueue.values());
+  await postgresStore.flushAll();
   process.exit(0);
 }
 

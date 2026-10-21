@@ -148,36 +148,14 @@ interface HeaderCategoriesNavProps {
   currentCategory?: string;
 }
 
-const DISABLED_DROPDOWN_CATEGORIES = new Set([
-  'AI Services',
-  'Technology & Programming',
-  'Writing & Translation',
-  'Design',
-  'Digital Marketing',
-  'Video, Photo & Image',
-  'Business',
-  'Music & Audio',
-  'Marketing, Branding & Sales'
-]);
+const DISABLED_DROPDOWN_CATEGORIES = new Set<string>();
 
 export const HeaderCategoriesNav: React.FC<HeaderCategoriesNavProps> = ({
   navigate,
   currentCategory
 }) => {
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
-  const timeoutRef = useRef<any>(null);
 
-  const handleMouseEnter = (slug: string) => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    setActiveCategory(slug);
-  };
-
-  const handleMouseLeave = () => {
-    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => {
-      setActiveCategory(null);
-    }, 250);
-  };
 
   return (
     <nav className="relative z-40 bg-white border-b border-slate-200/80 shadow-2xs text-xs">
@@ -190,22 +168,19 @@ export const HeaderCategoriesNav: React.FC<HeaderCategoriesNavProps> = ({
             const isRightAligned = idx >= PPH_CATEGORIES.length - 3;
 
             return (
-              <div
-                key={cat.slug}
+              <div 
+                key={cat.slug} 
                 className="relative shrink-0"
-                onMouseEnter={() => {
-                  if (hasDropdown) handleMouseEnter(cat.slug);
-                }}
-                onMouseLeave={() => {
-                  if (hasDropdown) handleMouseLeave();
-                }}
               >
                 <button
                   type="button"
                   onClick={(e) => {
-                    if (timeoutRef.current) clearTimeout(timeoutRef.current);
-                    setActiveCategory(null);
-                    navigate(`/categories/${cat.slug}`, e);
+                    e.preventDefault();
+                    if (hasDropdown) {
+                      setActiveCategory(isOpen ? null : cat.slug);
+                    } else {
+                      navigate(`/categories/${cat.slug}`, e);
+                    }
                   }}
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg transition-all text-xs font-medium whitespace-nowrap cursor-pointer ${
                     isOpen || isCurrent
@@ -225,8 +200,6 @@ export const HeaderCategoriesNav: React.FC<HeaderCategoriesNavProps> = ({
                     className={`absolute top-full -mt-0.5 pt-2 w-72 max-w-[calc(100vw-2rem)] z-[100] animate-in fade-in slide-in-from-top-1 duration-150 ${
                       isRightAligned ? 'right-0' : 'left-0'
                     }`}
-                    onMouseEnter={() => handleMouseEnter(cat.slug)}
-                    onMouseLeave={handleMouseLeave}
                   >
                     <div className="bg-white rounded-2xl shadow-2xl border border-slate-200/90 p-4">
                       <div className="px-2 pb-2.5 mb-3 border-b border-slate-100 flex items-center justify-between">
@@ -244,7 +217,6 @@ export const HeaderCategoriesNav: React.FC<HeaderCategoriesNavProps> = ({
                           href={`/categories/${cat.slug}`}
                           onClick={(e) => {
                             e.preventDefault();
-                            if (timeoutRef.current) clearTimeout(timeoutRef.current);
                             setActiveCategory(null);
                             navigate(`/categories/${cat.slug}`, e);
                           }}
@@ -260,7 +232,6 @@ export const HeaderCategoriesNav: React.FC<HeaderCategoriesNavProps> = ({
                             href={`/categories/${sub.slug}`}
                             onClick={(e) => {
                               e.preventDefault();
-                              if (timeoutRef.current) clearTimeout(timeoutRef.current);
                               setActiveCategory(null);
                               navigate(`/categories/${sub.slug}`, e);
                             }}

@@ -73,20 +73,20 @@ export function useWorkstreamRealtime({
               lastUnknownRefreshRef.current = Date.now();
               onUnknownOrderRef.current?.();
             }
-            // Delivery, revision, release, dispute etc. arrive as system messages; refetch orders so status follows.
-            if (incomingMsg.type === 'system' && onOrderStateChangedRef.current) {
+            // Delivery, revision, release, dispute, offers etc. arrive with system type or metadata.action; refetch orders so status follows.
+            if ((incomingMsg.type === 'system' || incomingMsg.metadata?.action) && onOrderStateChangedRef.current) {
               if (stateRefreshTimerRef.current) clearTimeout(stateRefreshTimerRef.current);
               stateRefreshTimerRef.current = setTimeout(() => onOrderStateChangedRef.current?.(), 400);
             }
             setMessages(prev => {
               // One-per-order lifecycle events may already exist locally under a different (client-made) id.
-              const singletonAction = incomingMsg.type === 'system' && ['escrow_released', 'review_submitted', 'order_auto_accepted'].includes(incomingMsg.metadata?.action)
+              const singletonAction = incomingMsg.type === 'system' && ['escrow_released', 'review_submitted', 'review_reply_submitted', 'order_auto_accepted', 'order_completed', 'deliverable_approved'].includes(incomingMsg.metadata?.action)
                 ? incomingMsg.metadata.action : null;
               const clientMsgId = incomingMsg.metadata?.clientMessageId;
               const isSame = (m: any) =>
                 m.id === incomingMsg.id ||
                 (clientMsgId && m.metadata?.clientMessageId === clientMsgId) ||
-                (singletonAction && m.type === 'system' && m.orderId === incomingMsg.orderId && m.metadata?.action === singletonAction);
+                (singletonAction && m.type === 'system' && m.orderId === incomingMsg.orderId && m.metadata?.action === incomingMsg.metadata?.action);
               const alreadyExists = prev.some(isSame);
               if (alreadyExists) {
                 // If it exists but was optimistic, update it with full server data

@@ -35,6 +35,19 @@ export interface WorkstreamMessage {
     offerId?: string;
     offerKind?: string;
     clientMessageId?: string;
+    files?: any;
+    reference?: string;
+    reviewerRole?: string;
+    rating?: number;
+    comment?: string;
+    version?: number;
+    notes?: string;
+    reason?: string;
+    oldDate?: string;
+    newDueDate?: string;
+    status?: string;
+    reply?: any;
+    [key: string]: any;
   };
   status?: 'sending' | 'sent' | 'failed';
 }
@@ -63,6 +76,8 @@ export interface WorkstreamOffer {
   additionalAmount?: number;
   clientAdditionalTotal?: number;
   currencySymbol?: string;
+  files?: Array<{ id?: string; name: string; size: string; url: string; uploadedAt?: string }>;
+  reference?: string;
 }
 
 export interface WorkstreamItem extends Order {

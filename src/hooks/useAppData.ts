@@ -1,17 +1,16 @@
-import { useState, useEffect, useCallback } from 'react';
-import { UserAccount, Gig, Project, Proposal, Order, Dispute, Refund, Payout, Category, Review, SupportTicket, AuditLog, Message } from '../types';
-import * as DatabaseService from '../services/DatabaseService';
-import { initialUsers, initialGigs, initialProjects, initialOrders } from '../data/mockData';
+import { useState, useCallback } from 'react';
+import { UserAccount, Gig, Project, Proposal, Order, Dispute, Refund, Payout, Category, Review, SupportTicket, AuditLog, Message, WorkstreamOffer } from '../types';
 import { getAuthToken } from '../utils/authToken';
 import { getDeviceId } from '../utils/deviceId';
 
 
 export const useAppData = (initialData?: any) => {
-  const [users, setUsers] = useState<UserAccount[]>(initialData?.users ?? initialUsers);
-  const [gigs, setGigs] = useState<Gig[]>(initialData?.gigs ?? initialGigs);
-  const [projects, setProjects] = useState<Project[]>(initialData?.projects ?? initialProjects);
+  const [users, setUsers] = useState<UserAccount[]>(initialData?.users ?? []);
+  const [gigs, setGigs] = useState<Gig[]>(initialData?.gigs ?? []);
+  const [projects, setProjects] = useState<Project[]>(initialData?.projects ?? []);
   const [proposals, setProposals] = useState<Proposal[]>([]);
-  const [orders, setOrders] = useState<Order[]>(initialOrders);
+  const [offers, setOffers] = useState<WorkstreamOffer[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [disputes, setDisputes] = useState<Dispute[]>([]);
@@ -40,17 +39,8 @@ export const useAppData = (initialData?: any) => {
     }
   };
 
-  useEffect(() => {
-    if (DatabaseService.Users && DatabaseService.Users.length > 0) setUsers(DatabaseService.Users);
-    if (DatabaseService.Gigs && DatabaseService.Gigs.length > 0) setGigs(DatabaseService.Gigs);
-    if (DatabaseService.Projects) setProjects(DatabaseService.Projects);
-    if (DatabaseService.Orders) setOrders(DatabaseService.Orders);
-  }, []);
-
-
-
-  const safeJson = async (res: Response, fallback: any = []) => {
-    if (!res.ok) return fallback;
+  const safeJson = async (res: Response | null, fallback: any = []) => {
+    if (!res || !res.ok) return fallback;
     const contentType = res.headers.get('content-type');
     if (!contentType || !contentType.includes('application/json')) return fallback;
     try {
@@ -71,61 +61,86 @@ export const useAppData = (initialData?: any) => {
       };
       const reqOpt = { headers: authHeaders };
 
-      const responses = await Promise.all([
+      let userRole: string | null = null;
+      try {
+        if (typeof window !== 'undefined') {
+          const cached = localStorage.getItem('current_user') || localStorage.getItem('user');
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (parsed?.role) userRole = parsed.role;
+          }
+        }
+        if (!userRole && token) {
+          const [b64] = token.split('.');
+          if (b64 && typeof atob === 'function') {
+            const json = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+            const payload = JSON.parse(json);
+            if (payload?.role) userRole = payload.role;
+          }
+        }
+      } catch {}
+
+      const isAdminOrSupport = Boolean(userRole && ['admin', 'super_admin', 'support'].includes(userRole));
+
+      const [uRes, gRes, pRes, prRes, offRes, oRes, cRes, revRes] = await Promise.all([
         fetch('/api/users', reqOpt),
         fetch('/api/gigs', reqOpt),
         fetch('/api/projects', reqOpt),
-        fetch('/api/proposals', reqOpt),
-        fetch('/api/orders', reqOpt),
-        fetch('/api/disputes', reqOpt),
-        fetch('/api/refunds', reqOpt),
-        fetch('/api/payouts', reqOpt),
+        token ? fetch('/api/proposals', reqOpt) : Promise.resolve(null),
+        token ? fetch('/api/offers', reqOpt) : Promise.resolve(null),
+        token ? fetch('/api/orders', reqOpt) : Promise.resolve(null),
         fetch('/api/categories', reqOpt),
-        fetch('/api/reviews', reqOpt),
-        fetch('/api/support-tickets', reqOpt),
-        fetch('/api/audit-logs', reqOpt),
-        fetch('/api/admin/settings', reqOpt)
+        fetch('/api/reviews', reqOpt)
       ]);
 
-      const [uRes, gRes, pRes, prRes, oRes, dRes, rRes, payRes, cRes, revRes, sRes, aRes, setRes] = responses;
+      const usersData = await safeJson(uRes, null);
+      const gigsData = await safeJson(gRes, null);
+      const projectsData = await safeJson(pRes, null);
+      const proposalsData = await safeJson(prRes, null);
+      const offersData = await safeJson(offRes, null);
+      const ords = await safeJson(oRes, null);
+      const categoriesData = await safeJson(cRes, null);
+      const reviewsData = await safeJson(revRes, null);
 
-      const usersData = uRes.ok ? await safeJson(uRes, []) : [];
-      const gigsData = gRes.ok ? await safeJson(gRes, []) : [];
-      const projectsData = pRes.ok ? await safeJson(pRes, []) : [];
-      const proposalsData = prRes.ok ? await safeJson(prRes, []) : [];
-      const ords = oRes.ok ? await safeJson(oRes, []) : [];
-      const disputesData = dRes.ok ? await safeJson(dRes, []) : [];
-      const refundsData = rRes.ok ? await safeJson(rRes, []) : [];
-      const payoutsData = payRes.ok ? await safeJson(payRes, []) : [];
-      const categoriesData = cRes.ok ? await safeJson(cRes, []) : [];
-      const reviewsData = revRes.ok ? await safeJson(revRes, []) : [];
-      const supportTicketsData = sRes.ok ? await safeJson(sRes, []) : [];
-      const auditLogsData = aRes.ok ? await safeJson(aRes, []) : [];
-      const settingsData = setRes.ok ? await safeJson(setRes, null) : null;
+      if (Array.isArray(usersData) && usersData.length > 0) setUsers(usersData);
+      if (Array.isArray(gigsData) && gigsData.length > 0) setGigs(gigsData);
+      if (Array.isArray(projectsData) && projectsData.length > 0) setProjects(projectsData);
+      if (Array.isArray(proposalsData)) setProposals(proposalsData);
+      if (Array.isArray(offersData)) setOffers(offersData);
+      if (Array.isArray(ords)) setOrders(ords);
+      if (Array.isArray(categoriesData) && categoriesData.length > 0) setCategories(categoriesData);
+      if (Array.isArray(reviewsData)) setReviews(reviewsData);
 
-      if (usersData.length > 0) setUsers(usersData);
-      else setUsers(DatabaseService.Users);
-      
-      if (gigsData.length > 0) setGigs(gigsData);
-      else setGigs(DatabaseService.Gigs);
+      if (token && isAdminOrSupport) {
+        const [dRes, rRes, payRes, sRes, aRes, setRes] = await Promise.all([
+          fetch('/api/disputes', reqOpt),
+          fetch('/api/refunds', reqOpt),
+          fetch('/api/payouts', reqOpt),
+          fetch('/api/support-tickets', reqOpt),
+          fetch('/api/audit-logs', reqOpt),
+          fetch('/api/admin/settings', reqOpt)
+        ]);
 
-      if (projectsData.length > 0) setProjects(projectsData);
-      if (proposalsData.length > 0) setProposals(proposalsData);
-      if (ords.length > 0) setOrders(ords);
-      if (disputesData.length > 0) setDisputes(disputesData);
-      if (refundsData.length > 0) setRefunds(refundsData);
-      if (payoutsData.length > 0) setPayouts(payoutsData);
-      if (categoriesData.length > 0) setCategories(categoriesData);
-      if (reviewsData.length > 0) setReviews(reviewsData);
-      if (supportTicketsData.length > 0) setSupportTickets(supportTicketsData);
-      if (auditLogsData.length > 0) setAuditLogs(auditLogsData);
-      
-      if (settingsData) {
-        if (settingsData.freelancerCommissionRate !== undefined) setPlatformFee(settingsData.freelancerCommissionRate);
-        if (settingsData.clientServiceFee !== undefined) setClientServiceFee(settingsData.clientServiceFee);
-        if (settingsData.smallOrderFeeThreshold !== undefined) setSmallOrderFeeThreshold(settingsData.smallOrderFeeThreshold);
-        if (settingsData.smallOrderFeeAmount !== undefined) setSmallOrderFeeAmount(settingsData.smallOrderFeeAmount);
-        if (settingsData.escrowHoldDays !== undefined) setEscrowProtectionDays(settingsData.escrowHoldDays);
+        const disputesData = await safeJson(dRes, []);
+        const refundsData = await safeJson(rRes, []);
+        const payoutsData = await safeJson(payRes, []);
+        const supportTicketsData = await safeJson(sRes, []);
+        const auditLogsData = await safeJson(aRes, []);
+        const settingsData = await safeJson(setRes, null);
+
+        if (disputesData.length > 0) setDisputes(disputesData);
+        if (refundsData.length > 0) setRefunds(refundsData);
+        if (payoutsData.length > 0) setPayouts(payoutsData);
+        if (supportTicketsData.length > 0) setSupportTickets(supportTicketsData);
+        if (auditLogsData.length > 0) setAuditLogs(auditLogsData);
+
+        if (settingsData) {
+          if (settingsData.freelancerCommissionRate !== undefined) setPlatformFee(settingsData.freelancerCommissionRate);
+          if (settingsData.clientServiceFee !== undefined) setClientServiceFee(settingsData.clientServiceFee);
+          if (settingsData.smallOrderFeeThreshold !== undefined) setSmallOrderFeeThreshold(settingsData.smallOrderFeeThreshold);
+          if (settingsData.smallOrderFeeAmount !== undefined) setSmallOrderFeeAmount(settingsData.smallOrderFeeAmount);
+          if (settingsData.escrowHoldDays !== undefined) setEscrowProtectionDays(settingsData.escrowHoldDays);
+        }
       }
     } catch (e) {
       setError('Failed to fetch data');
@@ -140,6 +155,7 @@ export const useAppData = (initialData?: any) => {
     gigs, setGigs,
     projects, setProjects,
     proposals, setProposals,
+    offers, setOffers,
     orders, setOrders,
     reviews, setReviews,
     messages, setMessages,
